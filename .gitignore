@@ -1,17 +1,46 @@
-.dotnet-home/
+# Build output
 **/bin/
 **/obj/
-*.user
+artifacts/
+.msbuild-bin/
+.msbuild-obj/
+
+# .NET local state
+.dotnet-home/
+.nuget/
+*.nupkg
+*.snupkg
+project.assets.json
+project.nuget.cache
+
+# IDE and editor state
+.vs/
+.vscode/
+.idea/
 *.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.rsuser
+
+# Logs, dumps, and temporary files
 *.log
 *.tmp
-*.nupkg
-artifacts/
-.msbuild-obj/
-.msbuild-bin/
+*.temp
+*.dmp
+*.mdmp
+TestResults/
+coverage/
+coverage.*
+
+# Local game and MelonLoader files copied in for inspection/testing
 GameRefs/
 MelonLoader/
-UserData/
 Mods/
 Plugins/
+UserData/
 tools/
+
+# Codex/local agent scratch state
+.agents/
+.codex/

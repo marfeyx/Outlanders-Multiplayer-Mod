@@ -3,7 +3,7 @@ using OutlandersMultiplayer.Mod.Game;
 using OutlandersMultiplayer.Mod.Overlay;
 using MelonLoader;
 
-[assembly: MelonInfo(typeof(OutlandersMultiplayer.Mod.OutlandersMultiplayerMelon), "Outlanders Multiplayer", "0.1.0", "Codex")]
+[assembly: MelonInfo(typeof(OutlandersMultiplayer.Mod.OutlandersMultiplayerMelon), "Outlanders Multiplayer", "0.1.0", "Marfeyx")]
 [assembly: MelonGame("Pomelo Games", "Outlanders")]
 
 namespace OutlandersMultiplayer.Mod;
