@@ -1,5 +1,6 @@
 using System;
 using OutlandersMultiplayer.Core.Protocol;
+using OutlandersMultiplayer.Core.Relay;
 
 namespace OutlandersMultiplayer.Mod.Overlay;
 
@@ -13,8 +14,9 @@ public sealed class MultiplayerOverlay
     private string _relayPort = (ProtocolConstants.DefaultPort + 1).ToString();
     private string _roomCode = "OUTLANDERS";
     private string _sessionKey = string.Empty;
+    private string _joinCode = string.Empty;
     private string _playerName = Environment.UserName;
-    private bool _relayMode;
+    private bool _showAdvanced;
     private readonly ReflectionGui _gui = new();
 
     public MultiplayerOverlay(MultiplayerController controller)
@@ -47,14 +49,16 @@ public sealed class MultiplayerOverlay
         const float y0 = 24f;
         const float width = 468f;
         const float pad = 14f;
+        var panelHeight = _showAdvanced ? 548f : 398f;
+        var formHeight = _showAdvanced ? 356f : 208f;
         var y = y0;
 
-        DrawBox(x, y, width, 452, 0.13f, 0.15f, 0.13f, " ");
-        DrawBox(x + 4, y + 4, width - 8, 444, 0.29f, 0.31f, 0.25f, " ");
+        DrawBox(x, y, width, panelHeight, 0.13f, 0.15f, 0.13f, " ");
+        DrawBox(x + 4, y + 4, width - 8, panelHeight - 8, 0.29f, 0.31f, 0.25f, " ");
         DrawBox(x + 10, y + 10, width - 20, 62, 0.18f, 0.24f, 0.19f, " ");
 
         DrawLabel(x + 24, y + 18, 250, 24, "Outlanders Multiplayer", 0.98f, 0.95f, 0.84f);
-        DrawLabel(x + 24, y + 42, 350, 20, _relayMode ? "Internet relay room" : "Direct connection", 0.76f, 0.81f, 0.68f);
+        DrawLabel(x + 24, y + 42, 350, 20, "Host online, copy one code, and send it to your friend.", 0.76f, 0.81f, 0.68f);
         if (DrawButton(x + width - 78, y + 22, 48, 28, "Hide", 0.27f, 0.24f, 0.21f))
         {
             _visible = false;
@@ -64,71 +68,63 @@ public sealed class MultiplayerOverlay
         DrawStatusStrip(x + pad, y, width - pad * 2);
         y += 52;
 
-        if (DrawButton(x + pad, y, 214, 34, "Direct", !_relayMode ? 0.35f : 0.22f, !_relayMode ? 0.45f : 0.25f, !_relayMode ? 0.34f : 0.22f))
-        {
-            _relayMode = false;
-        }
-
-        if (DrawButton(x + pad + 222, y, 214, 34, "Relay", _relayMode ? 0.35f : 0.22f, _relayMode ? 0.45f : 0.25f, _relayMode ? 0.34f : 0.22f))
-        {
-            _relayMode = true;
-        }
-        y += 48;
-
-        DrawBox(x + pad, y, width - pad * 2, 186, 0.21f, 0.23f, 0.19f, " ");
+        DrawBox(x + pad, y, width - pad * 2, formHeight, 0.21f, 0.23f, 0.19f, " ");
         y += 14;
         DrawField(x + 36, y, "Player", ref _playerName, 32);
         y += 34;
-        DrawField(x + 36, y, "Session Key", ref _sessionKey, 64);
+        DrawField(x + 36, y, "Join Code", ref _joinCode, 512);
         y += 42;
 
-        if (_relayMode)
+        if (DrawButton(x + 36, y, 126, 34, "Host Online", 0.40f, 0.54f, 0.36f))
+        {
+            HostOnline();
+        }
+
+        if (DrawButton(x + 170, y, 126, 34, "Join Code", 0.34f, 0.42f, 0.52f))
+        {
+            JoinOnline();
+        }
+
+        if (DrawButton(x + 304, y, 92, 34, "Copy Code", 0.35f, 0.38f, 0.30f))
+        {
+            _gui.SetClipboard(_joinCode);
+        }
+
+        y += 44;
+        if (DrawButton(x + 36, y, 126, 30, _showAdvanced ? "Hide Advanced" : "Advanced", 0.26f, 0.29f, 0.24f))
+        {
+            _showAdvanced = !_showAdvanced;
+        }
+
+        if (DrawButton(x + 304, y, 92, 30, "Disconnect", 0.39f, 0.29f, 0.24f))
+        {
+            _controller.Disconnect();
+        }
+
+        y += 42;
+        if (_showAdvanced)
         {
             DrawField(x + 36, y, "Relay Host", ref _relayHost, 128);
             y += 34;
             DrawField(x + 36, y, "Relay Port", ref _relayPort, 8);
             y += 34;
-            DrawField(x + 36, y, "Room Code", ref _roomCode, 32);
-            y += 42;
-        }
-        else
-        {
-            DrawField(x + 36, y, "Host/IP", ref _host, 128);
+            DrawField(x + 36, y, "Direct IP", ref _host, 128);
             y += 34;
-            DrawField(x + 36, y, "Port", ref _port, 8);
-            y += 76;
-        }
+            DrawField(x + 36, y, "Direct Port", ref _port, 8);
+            y += 38;
 
-        if (DrawButton(x + pad, y, 146, 36, "Host", 0.40f, 0.54f, 0.36f))
-        {
-            if (_relayMode)
-            {
-                _controller.HostViaRelay(_relayHost, ParseRelayPort(), _roomCode, _sessionKey);
-            }
-            else
+            if (DrawButton(x + 36, y, 126, 30, "Host Direct", 0.32f, 0.42f, 0.32f))
             {
                 _controller.Host(ParsePort(), _sessionKey);
             }
-        }
 
-        if (DrawButton(x + pad + 154, y, 146, 36, "Join", 0.34f, 0.42f, 0.52f))
-        {
-            if (_relayMode)
-            {
-                _controller.JoinViaRelay(_relayHost, ParseRelayPort(), _roomCode, _sessionKey, _playerName);
-            }
-            else
+            if (DrawButton(x + 170, y, 126, 30, "Join Direct", 0.30f, 0.36f, 0.46f))
             {
                 _controller.Join(_host, ParsePort(), _sessionKey, _playerName);
             }
         }
 
-        if (DrawButton(x + pad + 308, y, 128, 36, "Disconnect", 0.39f, 0.29f, 0.24f))
-        {
-            _controller.Disconnect();
-        }
-
-        y += 50;
+        y = y0 + panelHeight - 34;
         var players = _controller.State.Players;
         if (players.Count > 0)
         {
@@ -136,7 +132,7 @@ public sealed class MultiplayerOverlay
         }
         else
         {
-            DrawLabel(x + pad + 10, y, width - 48, 20, _relayMode ? "Share relay host, room code, and session key with your friend." : "Use direct mode for LAN, VPN, or port-forwarded hosts.", 0.70f, 0.74f, 0.66f);
+            DrawLabel(x + pad + 10, y, width - 48, 20, "Your friend only needs the join code. Relay settings are tucked away in Advanced.", 0.70f, 0.74f, 0.66f);
         }
     }
 
@@ -181,6 +177,36 @@ public sealed class MultiplayerOverlay
         return clicked;
     }
 
+    private void HostOnline()
+    {
+        if (IsLocalRelayHost(_relayHost))
+        {
+            _controller.State.SetError("Set a public relay host in Advanced before hosting online.");
+            _showAdvanced = true;
+            return;
+        }
+
+        _roomCode = JoinCode.CreateRoomCode();
+        _sessionKey = JoinCode.CreateSessionKey();
+        _joinCode = JoinCode.Encode(_relayHost, ParseRelayPort(), _roomCode, _sessionKey);
+        _controller.HostViaRelay(_relayHost, ParseRelayPort(), _roomCode, _sessionKey);
+    }
+
+    private void JoinOnline()
+    {
+        if (!JoinCode.TryDecode(_joinCode, out var code))
+        {
+            _controller.State.SetError("Join code is invalid.");
+            return;
+        }
+
+        _relayHost = code.RelayHost;
+        _relayPort = code.RelayPort.ToString();
+        _roomCode = code.RoomCode;
+        _sessionKey = code.SessionKey;
+        _controller.JoinViaRelay(code.RelayHost, code.RelayPort, code.RoomCode, code.SessionKey, _playerName);
+    }
+
     private int ParsePort()
     {
         return int.TryParse(_port, out var parsed) && parsed > 0 ? parsed : ProtocolConstants.DefaultPort;
@@ -189,5 +215,14 @@ public sealed class MultiplayerOverlay
     private int ParseRelayPort()
     {
         return int.TryParse(_relayPort, out var parsed) && parsed > 0 ? parsed : ProtocolConstants.DefaultPort + 1;
+    }
+
+    private static bool IsLocalRelayHost(string host)
+    {
+        var value = (host ?? string.Empty).Trim();
+        return value.Length == 0
+            || value.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("localhost", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("::1", StringComparison.OrdinalIgnoreCase);
     }
 }

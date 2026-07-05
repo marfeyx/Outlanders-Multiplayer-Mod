@@ -1,104 +1,206 @@
 # Outlanders Multiplayer Mod
 
-Prototype MelonLoader IL2CPP multiplayer mod for the Steam version of Outlanders.
+Prototype MelonLoader mod for the Steam version of Outlanders.
 
-Current status:
+This project is building toward friend-hosted multiplayer for Sandbox/Endless saves. The current build already installs as a real MelonLoader mod, shows an in-game menu, supports LAN/direct networking, supports online relay join codes, and can transfer a host save snapshot into a safe temporary client slot. Full live gameplay synchronization is still in progress.
 
-- Builds a real MelonLoader `net6.0` mod DLL against MelonLoader `v0.7.3`.
-- Uses LiteNetLib direct-IP UDP networking.
-- Adds an in-game IMGUI overlay through reflection.
-- Adds Internet relay mode for players who cannot port-forward or are not on the same LAN.
-- Host can serve the latest `Endless_*.dat` sandbox save as a compressed, chunked snapshot.
-- Client can join, validate the snapshot hash, and write it only into `OutlandersMultiplayerTemp`.
-- Live gameplay command hooks are scaffolded but not complete; they require the MelonLoader IL2CPP generated assemblies and runtime instrumentation pass.
+## Current Status
 
-## Build
+- Works with Windows Steam Outlanders.
+- Uses MelonLoader `v0.7.3` for Unity IL2CPP mod loading.
+- Adds an in-game `Outlanders Multiplayer` menu.
+- Supports `Host Online` and `Join Code` through a relay server.
+- Supports `Host Direct` and `Join Direct` for LAN, VPN, or port-forwarded direct IP play.
+- Sends the host's latest `Endless_*.dat` save as a compressed snapshot.
+- Writes client snapshots only into `OutlandersMultiplayerTemp`.
+- Does not overwrite normal Outlanders save slots.
+- Live build orders, villagers, resources, decrees, and time sync are not complete yet.
+
+## Fast Install
+
+1. Close Outlanders.
+2. Open PowerShell in this project folder:
 
 ```powershell
-$env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
-dotnet build .\OutlandersMultiplayer.Mod\OutlandersMultiplayer.Mod.csproj -c Release
-dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj
+cd "C:\Outlanders Multiplayer Mod"
 ```
 
-The mod build expects MelonLoader `v0.7.3` extracted at:
+3. Run the installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Install-OutlandersMultiplayer.ps1
+```
+
+4. Start Outlanders from Steam.
+5. Check the MelonLoader console. You should see:
 
 ```text
-tools\MelonLoader.x64.v0.7.3\MelonLoader\net6\MelonLoader.dll
+Outlanders Multiplayer v0.1.0
 ```
 
-## Package
+The installer copies MelonLoader into the Outlanders game folder if it is missing, then copies the mod files into the game's `Mods` folder.
 
-```powershell
-.\scripts\Build-Package.ps1
+## Manual Install
+
+Use this only if the install script does not work.
+
+1. Close Outlanders.
+2. Install MelonLoader `v0.7.3` x64 into the Outlanders game folder.
+3. Create this folder if it does not exist:
+
+```text
+C:\Program Files (x86)\Steam\steamapps\common\Outlanders\Mods
 ```
 
-This creates:
+4. Copy these files into that `Mods` folder:
 
 ```text
 artifacts\OutlandersMultiplayer\Mods\OutlandersMultiplayer.Mod.dll
 artifacts\OutlandersMultiplayer\Mods\OutlandersMultiplayer.Core.dll
 artifacts\OutlandersMultiplayer\Mods\LiteNetLib.dll
-artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.dll
 ```
 
-## Install Locally
+5. Start Outlanders.
 
-Close Outlanders, then run:
+## Online Play With A Join Code
+
+This is the flow for playing with a friend over the internet:
+
+1. Start a relay server on a public machine.
+2. Host opens Outlanders and loads a Sandbox/Endless save.
+3. Host opens the multiplayer menu.
+4. Host opens `Advanced` once and sets:
+
+```text
+Relay Host = public IP or domain of the relay server
+Relay Port = 17668
+```
+
+5. Host clicks `Host Online`.
+6. Host clicks `Copy Code`.
+7. Host sends that one code to the friend.
+8. Friend pastes the code into `Join Code`.
+9. Friend clicks `Join Code`.
+
+Your friend should not need to type relay host, relay port, session key, or room details. Those are packed inside the join code.
+
+## Running The Relay Server
+
+Relay mode is what makes worldwide play possible without port forwarding on the host's home router.
+
+Run this on a VPS, cloud VM, rented server, or any computer that has a public TCP port:
 
 ```powershell
-.\scripts\Install-OutlandersMultiplayer.ps1
+.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668
 ```
 
-The script copies MelonLoader `version.dll`/`MelonLoader\` into the Outlanders folder if missing, then copies the mod DLLs into `Mods\`.
-
-## In Game
-
-1. Start Outlanders.
-2. Load or create an Endless/Sandbox save on the host.
-3. Use the `Outlanders Multiplayer` overlay.
-4. Direct/LAN: host clicks `Host Direct`; client enters the host IP/port/session key and clicks `Join Direct`.
-5. Internet relay: run the relay server on any public machine, then host and client enter the relay host/port, same room code, same session key, and click `Host via Relay` / `Join Relay`.
-
-Default direct UDP port: `17667`.
-Default relay TCP port: `17668`.
-
-## Internet Relay Mode
-
-Direct UDP only works worldwide when the host can receive inbound UDP traffic, usually by port forwarding or using a VPN. Relay mode avoids that: both players make outbound TCP connections to a public relay server.
-
-Run the relay on a VPS, cloud VM, or any machine with a public TCP port:
+If you prefer running the DLL:
 
 ```powershell
 dotnet .\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.dll 17668
 ```
 
-Firewall/NAT requirement:
+Firewall requirement:
 
-- Relay machine: allow inbound TCP `17668`.
-- Host/player machines: only need outbound TCP to the relay.
+- Relay server must allow inbound TCP `17668`.
+- Host and friend only need outbound TCP access to the relay.
 
-Relay behavior:
+If the game says `Set a public relay host in Advanced before hosting online`, the relay host is still set to `127.0.0.1`, `localhost`, or another local-only address. That cannot create a join code for a friend across the world. Set it to the public IP or domain of the relay server.
 
-- The first host in a room owns the room.
-- Clients must use the same room code and session key.
-- The relay forwards encrypted-at-transport? No. Current v1 relay is plaintext TCP, so use an unguessable session key and run it only for trusted friends. TLS can be added later.
+## LAN, VPN, Or Port Forwarding
 
-## Safety
+Direct mode is separate from join-code relay mode.
 
-Client snapshots are written to:
+Use direct mode only when your friend can directly reach the host computer:
+
+- same LAN,
+- same VPN,
+- or host has UDP port forwarding configured.
+
+Default direct port:
+
+```text
+17667 UDP
+```
+
+Host:
+
+1. Load a Sandbox/Endless save.
+2. Open `Advanced`.
+3. Click `Host Direct`.
+
+Friend:
+
+1. Open `Advanced`.
+2. Enter the host IP in `Direct IP`.
+3. Enter `17667` in `Direct Port`.
+4. Click `Join Direct`.
+
+## Save Safety
+
+Normal Outlanders saves are not overwritten by client snapshot joining.
+
+Client multiplayer snapshots are written under:
 
 ```text
 %USERPROFILE%\AppData\LocalLow\Pomelo Games\Outlanders\user-<steamid>\OutlandersMultiplayerTemp\
 ```
 
-The mod does not overwrite normal Outlanders save slots.
+The host still owns the real save. Back up important saves before testing because this is still a prototype mod.
 
-## Remaining Work
+## Troubleshooting
 
-The next milestone is the IL2CPP hook pass:
+`Outlanders Multiplayer` does not show in MelonLoader:
 
-- Launch with MelonLoader once to generate interop assemblies.
-- Log scene names, ECS worlds/systems, sandbox controllers, save/load managers, and input/build/decree methods.
-- Patch the exact methods that create build orders, demolish/cancel, priority changes, work slot changes, decrees, and time-speed changes.
-- Convert client-side local actions into network intents and apply host-accepted commands back through those same game methods.
-- Add deterministic world hashes over resources, buildings, construction state, day/time, and villagers.
+- Make sure the three mod DLLs are in the game's `Mods` folder.
+- Make sure MelonLoader is installed into the Outlanders folder, not this project folder.
+
+`Host Online` will not create a code:
+
+- Open `Advanced`.
+- Set `Relay Host` to a public IP or domain.
+- Keep `Relay Port` at `17668` unless your relay uses a different port.
+
+Friend cannot join with the code:
+
+- Make sure the relay server is still running.
+- Make sure TCP `17668` is open on the relay server firewall.
+- Make sure both players use the same mod build.
+- Create a new code and try again.
+
+MelonLoader shows remote API or 502/526 warnings:
+
+- Those are usually MelonLoader lookup warnings during startup.
+- If the mod still loads and the menu appears, they are not the multiplayer mod failing.
+
+## Build From Source
+
+Package everything:
+
+```powershell
+$env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
+.\scripts\Build-Package.ps1
+```
+
+Run protocol tests:
+
+```powershell
+$env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
+dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj
+```
+
+Build output:
+
+```text
+artifacts\OutlandersMultiplayer\Mods\
+artifacts\OutlandersMultiplayer\RelayServer\
+```
+
+## Next Development Work
+
+- Finish IL2CPP instrumentation for the exact Outlanders gameplay methods.
+- Patch build, demolish, cancel, priority, work-slot, decree, and time-speed actions.
+- Convert client actions into network intents.
+- Apply host-approved commands through the same game methods local play uses.
+- Add deterministic state hashes for resources, buildings, day/time, construction progress, and villagers.
+- Add corrective resync when clients diverge from the host.

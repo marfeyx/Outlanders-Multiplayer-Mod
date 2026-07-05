@@ -20,7 +20,8 @@ public static class TestRunner
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
-            ("relay join and protocol frames round-trip", RelayFramesRoundTrip)
+            ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
+            ("join code contains relay room and secret", JoinCodeRoundTrips)
         };
 
         var failed = 0;
@@ -125,6 +126,17 @@ public static class TestRunner
 
         Assert(frame.Type == RelayFrameType.Protocol, "relay frame type mismatch");
         Assert(restored.Sequence == 7, "relay protocol sequence mismatch");
+    }
+
+    private static void JoinCodeRoundTrips()
+    {
+        var code = JoinCode.Encode("relay.example.net", 17668, "ROOM123", "SECRET456");
+        Assert(code.StartsWith("OMP1:"), "join code prefix mismatch");
+        Assert(JoinCode.TryDecode(code, out var decoded), "join code should decode");
+        Assert(decoded.RelayHost == "relay.example.net", "relay host mismatch");
+        Assert(decoded.RelayPort == 17668, "relay port mismatch");
+        Assert(decoded.RoomCode == "ROOM123", "room code mismatch");
+        Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
     }
 
     private static void Assert(bool condition, string message)

@@ -8,6 +8,7 @@ public sealed class ReflectionGui
 {
     private readonly Type? _rectType;
     private readonly Type? _guiType;
+    private readonly Type? _guiUtilityType;
     private readonly Type? _colorType;
     private readonly MethodInfo? _guiButton;
     private readonly MethodInfo? _guiBox;
@@ -16,12 +17,14 @@ public sealed class ReflectionGui
     private readonly PropertyInfo? _guiColor;
     private readonly PropertyInfo? _guiBackgroundColor;
     private readonly PropertyInfo? _guiContentColor;
+    private readonly PropertyInfo? _systemCopyBuffer;
 
     public ReflectionGui()
     {
         _rectType = ResolveType("UnityEngine.Rect");
         _colorType = ResolveType("UnityEngine.Color");
         _guiType = ResolveType("UnityEngine.GUI");
+        _guiUtilityType = ResolveType("UnityEngine.GUIUtility");
         _guiButton = FindRectString(_guiType, "Button");
         _guiBox = FindRectString(_guiType, "Box");
         _guiLabel = FindRectString(_guiType, "Label");
@@ -29,6 +32,7 @@ public sealed class ReflectionGui
         _guiColor = _guiType?.GetProperty("color", BindingFlags.Public | BindingFlags.Static);
         _guiBackgroundColor = _guiType?.GetProperty("backgroundColor", BindingFlags.Public | BindingFlags.Static);
         _guiContentColor = _guiType?.GetProperty("contentColor", BindingFlags.Public | BindingFlags.Static);
+        _systemCopyBuffer = _guiUtilityType?.GetProperty("systemCopyBuffer", BindingFlags.Public | BindingFlags.Static);
     }
 
     public bool Button(float x, float y, float width, float height, string text)
@@ -83,6 +87,11 @@ public sealed class ReflectionGui
         SetColor(1f, 1f, 1f, 1f);
         SetBackgroundColor(1f, 1f, 1f, 1f);
         SetContentColor(1f, 1f, 1f, 1f);
+    }
+
+    public void SetClipboard(string text)
+    {
+        _systemCopyBuffer?.SetValue(null, text ?? string.Empty);
     }
 
     private void SetUnityColor(PropertyInfo? property, float r, float g, float b, float a)
