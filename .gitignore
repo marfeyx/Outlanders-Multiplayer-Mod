@@ -1,0 +1,17 @@
+.dotnet-home/
+**/bin/
+**/obj/
+*.user
+*.suo
+*.log
+*.tmp
+*.nupkg
+artifacts/
+.msbuild-obj/
+.msbuild-bin/
+GameRefs/
+MelonLoader/
+UserData/
+Mods/
+Plugins/
+tools/

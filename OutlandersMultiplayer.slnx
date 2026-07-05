@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="OutlandersMultiplayer.Core/OutlandersMultiplayer.Core.csproj" />
+  <Project Path="OutlandersMultiplayer.Mod/OutlandersMultiplayer.Mod.csproj" />
+  <Project Path="OutlandersMultiplayer.RelayServer/OutlandersMultiplayer.RelayServer.csproj" />
+  <Project Path="OutlandersMultiplayer.Tests/OutlandersMultiplayer.Tests.csproj" />
+</Solution>
