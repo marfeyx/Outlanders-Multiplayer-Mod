@@ -202,8 +202,10 @@ Run protocol tests:
 
 ```powershell
 $env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
-dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj
+dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj --configuration Release
 ```
+
+The same command runs automatically in GitHub Actions for every pull request and push to `main`. The command exits with a nonzero status if any protocol, snapshot, relay-frame, or join-code test fails.
 
 Build output:
 
