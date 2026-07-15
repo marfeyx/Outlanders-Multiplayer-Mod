@@ -6,6 +6,8 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $env:DOTNET_CLI_HOME = Join-Path $root ".dotnet-home"
 
+& (Join-Path $PSScriptRoot "Bootstrap-MelonLoader.ps1")
+
 dotnet build (Join-Path $root "OutlandersMultiplayer.Mod\OutlandersMultiplayer.Mod.csproj") -c $Configuration
 dotnet build (Join-Path $root "OutlandersMultiplayer.RelayServer\OutlandersMultiplayer.RelayServer.csproj") -c $Configuration
 

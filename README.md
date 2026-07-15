@@ -40,6 +40,14 @@ Outlanders Multiplayer v0.1.0
 
 The installer copies MelonLoader into the Outlanders game folder if it is missing, then copies the mod files into the game's `Mods` folder.
 
+On the first run, the build automatically downloads the official [MelonLoader v0.7.3 x64 archive](https://github.com/LavaGang/MelonLoader/releases/download/v0.7.3/MelonLoader.x64.zip), verifies its SHA-256 checksum, and extracts it to:
+
+```text
+tools\MelonLoader.x64.v0.7.3\
+```
+
+The fast-install path therefore requires an internet connection and the .NET 8 SDK on the first run. To bootstrap the dependency separately, run `powershell -ExecutionPolicy Bypass -File .\scripts\Bootstrap-MelonLoader.ps1`.
+
 ## Manual Install
 
 Use this only if the install script does not work.
@@ -180,6 +188,14 @@ Package everything:
 ```powershell
 $env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
 .\scripts\Build-Package.ps1
+```
+
+`Build-Package.ps1` runs the pinned MelonLoader bootstrap automatically. No manual `tools` directory setup is required in a fresh checkout.
+
+Validate the bootstrap without downloading or modifying the real dependency folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Test-Bootstrap-MelonLoader.ps1
 ```
 
 Run protocol tests:
