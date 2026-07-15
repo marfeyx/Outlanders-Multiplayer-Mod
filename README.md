@@ -2,7 +2,7 @@
 
 Prototype MelonLoader mod for the Steam version of Outlanders.
 
-This project is building toward friend-hosted multiplayer for Sandbox/Endless saves. The current build already installs as a real MelonLoader mod, shows an in-game menu, supports LAN/direct networking, supports online relay join codes, and can transfer a host save snapshot into a safe temporary client slot. Full live gameplay synchronization is still in progress.
+This project is building toward friend-hosted multiplayer for Sandbox/Endless saves. The current build already installs as a real MelonLoader mod, shows an in-game menu, supports LAN/direct networking, supports online relay join codes, and can transfer a host save snapshot into a new client Sandbox slot. Full live gameplay synchronization is still in progress.
 
 ## Current Status
 
@@ -11,8 +11,8 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Adds an in-game `Outlanders Multiplayer` menu.
 - Supports `Host Online` and `Join Code` through a relay server.
 - Supports `Host Direct` and `Join Direct` for LAN, VPN, or port-forwarded direct IP play.
-- Sends the host's latest `Endless_*.dat` save as a compressed snapshot.
-- Writes client snapshots only into `OutlandersMultiplayerTemp`.
+- Sends the host's explicitly selected `Endless_*.dat` save as a compressed snapshot.
+- Registers client snapshots as new `Endless_N.dat` slots in the active Outlanders save game.
 - Does not overwrite normal Outlanders save slots.
 - Live build orders, villagers, resources, decrees, and time sync are not complete yet.
 - Direct and relay sessions carry validated player intents, host-assigned commands, and per-tick state hashes; exact Outlanders gameplay hooks still need to call these protocol APIs.
@@ -40,6 +40,14 @@ Outlanders Multiplayer v0.1.0
 ```
 
 The installer copies MelonLoader into the Outlanders game folder if it is missing, then copies the mod files into the game's `Mods` folder.
+
+On the first run, the build automatically downloads the official [MelonLoader v0.7.3 x64 archive](https://github.com/LavaGang/MelonLoader/releases/download/v0.7.3/MelonLoader.x64.zip), verifies its SHA-256 checksum, and extracts it to:
+
+```text
+tools\MelonLoader.x64.v0.7.3\
+```
+
+The fast-install path therefore requires an internet connection and the .NET 8 SDK on the first run. To bootstrap the dependency separately, run `powershell -ExecutionPolicy Bypass -File .\scripts\Bootstrap-MelonLoader.ps1`.
 
 ## Manual Install
 
@@ -103,6 +111,14 @@ If you prefer running the DLL:
 dotnet .\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.dll 17668
 ```
 
+The optional second and third arguments set the initial join-handshake timeout and the later client-read timeout in seconds. Defaults are 10 seconds and 120 seconds:
+
+```powershell
+.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668 10 120
+```
+
+Connections that do not send a complete join frame or stop sending frames after joining are closed without stopping the relay or disconnecting other rooms.
+
 Firewall requirement:
 
 - Relay server must allow inbound TCP `17668`.
@@ -143,11 +159,15 @@ Friend:
 
 Normal Outlanders saves are not overwritten by client snapshot joining.
 
-Client multiplayer snapshots are written under:
+The multiplayer overlay shows the exact `user-*\Endless_*.dat` save selected for hosting. Only top-level saves in `user-*` folders are eligible; backup subfolders and `OutlandersMultiplayerTemp` are never hosting candidates. If more than one normal save exists, use the previous/next controls to choose one before starting direct or relay hosting. Hosting refuses to start until that choice is valid.
+
+Client multiplayer snapshots are registered under the active save game's `Endless` folder with the first unused slot number:
 
 ```text
-%USERPROFILE%\AppData\LocalLow\Pomelo Games\Outlanders\user-<steamid>\OutlandersMultiplayerTemp\
+%USERPROFILE%\AppData\LocalLow\Pomelo Games\Outlanders\user-<steamid>\<save-id>\Endless\Endless_N.dat
 ```
+
+After the transfer finishes, follow the persistent overlay instruction: return to `Main Menu`, open `Sandbox`, choose `Load`, and select the displayed `Endless_N.dat` slot. Automatic IL2CPP world loading is intentionally deferred until the exact game load API can be invoked safely.
 
 The host still owns the real save. Back up important saves before testing because this is still a prototype mod.
 
@@ -170,6 +190,7 @@ Friend cannot join with the code:
 - Make sure TCP `17668` is open on the relay server firewall.
 - Make sure both players use the same mod build.
 - Create a new code and try again.
+- Unreachable relay attempts remain non-blocking and show an overlay error after the 10-second connection timeout.
 
 MelonLoader shows remote API or 502/526 warnings:
 
@@ -185,12 +206,22 @@ $env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
 .\scripts\Build-Package.ps1
 ```
 
+`Build-Package.ps1` runs the pinned MelonLoader bootstrap automatically. No manual `tools` directory setup is required in a fresh checkout.
+
+Validate the bootstrap without downloading or modifying the real dependency folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Test-Bootstrap-MelonLoader.ps1
+```
+
 Run protocol tests:
 
 ```powershell
 $env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
-dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj
+dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj --configuration Release
 ```
+
+The same command runs automatically in GitHub Actions for every pull request and push to `main`. The command exits with a nonzero status if any protocol, snapshot, relay-frame, or join-code test fails.
 
 Build output:
 
