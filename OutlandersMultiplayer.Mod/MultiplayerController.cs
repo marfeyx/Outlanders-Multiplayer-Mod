@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using LiteNetLib;
 using OutlandersMultiplayer.Core.Protocol;
 using OutlandersMultiplayer.Core.Relay;
@@ -16,6 +17,7 @@ public sealed class MultiplayerController : IDisposable
     private readonly SessionState _state;
     private readonly Action<string> _log;
     private readonly Dictionary<string, SnapshotChunk> _receivedChunks = new();
+    private readonly Dictionary<string, string> _relayPlayerNames = new(StringComparer.Ordinal);
     private LiteNetLibDirectTransport? _transport;
     private TcpRelayTransport? _relayTransport;
     private SnapshotPackage? _hostSnapshot;
@@ -136,7 +138,7 @@ public sealed class MultiplayerController : IDisposable
         _relayTransport.StatusReceived += status => _log($"Relay status: {status}");
         _relayTransport.Rejected += reason => _state.SetError(reason);
         _relayTransport.Disconnected += reason => _state.SetStatus(SessionStatus.Offline, $"Relay disconnected: {reason}");
-        _relayTransport.MessageReceived += HandleClientRelayMessage;
+        _relayTransport.MessageReceived += (_, envelope) => HandleClientRelayMessage(envelope);
         _relayTransport.Connect(relayHost, relayPort, new RelayJoinRequest
         {
             Role = RelayRole.Client,
@@ -173,6 +175,7 @@ public sealed class MultiplayerController : IDisposable
         _hostSnapshot = null;
         _clientManifest = null;
         _receivedChunks.Clear();
+        _relayPlayerNames.Clear();
         _state.SetStatus(SessionStatus.Offline, "Offline");
         _state.SetPlayers(Array.Empty<string>());
     }
@@ -225,9 +228,9 @@ public sealed class MultiplayerController : IDisposable
         _log($"Sent snapshot {_hostSnapshot.Manifest.SnapshotId} to {request.PlayerName} ({_hostSnapshot.Manifest.ChunkCount} chunks).");
     }
 
-    private void HandleHostRelayMessage(ProtocolEnvelope envelope)
+    private void HandleHostRelayMessage(string connectionId, ProtocolEnvelope envelope)
     {
-        if (envelope.Type != ProtocolMessageType.HandshakeRequest)
+        if (envelope.Type != ProtocolMessageType.HandshakeRequest || string.IsNullOrWhiteSpace(connectionId))
         {
             return;
         }
@@ -240,19 +243,20 @@ public sealed class MultiplayerController : IDisposable
         }
 
         var responseType = response.Accepted ? ProtocolMessageType.HandshakeAccepted : ProtocolMessageType.HandshakeRejected;
-        _relayTransport?.Send(new ProtocolEnvelope(responseType, NextSequence(), response.ToPayload()));
+        _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(responseType, NextSequence(), response.ToPayload()));
         if (!response.Accepted || _hostSnapshot == null)
         {
             return;
         }
 
-        _relayTransport?.Send(new ProtocolEnvelope(ProtocolMessageType.SnapshotManifest, NextSequence(), _hostSnapshot.Manifest.ToPayload()));
+        _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(ProtocolMessageType.SnapshotManifest, NextSequence(), _hostSnapshot.Manifest.ToPayload()));
         foreach (var chunk in _hostSnapshot.Chunks)
         {
-            _relayTransport?.Send(new ProtocolEnvelope(ProtocolMessageType.SnapshotChunk, NextSequence(), chunk.ToPayload()));
+            _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(ProtocolMessageType.SnapshotChunk, NextSequence(), chunk.ToPayload()));
         }
 
-        _state.SetPlayers(new[] { "Host", request.PlayerName });
+        _relayPlayerNames[connectionId] = request.PlayerName;
+        _state.SetPlayers(new[] { "Host" }.Concat(_relayPlayerNames.Values));
         _log($"Sent relay snapshot {_hostSnapshot.Manifest.SnapshotId} to {request.PlayerName} ({_hostSnapshot.Manifest.ChunkCount} chunks).");
     }
 

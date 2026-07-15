@@ -21,6 +21,7 @@ public static class TestRunner
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
+            ("relay routing isolates targeted clients", RelayRoutingIsolatesTargetedClients),
             ("join code contains relay room and secret", JoinCodeRoundTrips)
         };
 
@@ -137,6 +138,58 @@ public static class TestRunner
         Assert(decoded.RelayPort == 17668, "relay port mismatch");
         Assert(decoded.RoomCode == "ROOM123", "room code mismatch");
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
+    }
+
+    private static void RelayRoutingIsolatesTargetedClients()
+    {
+        var clientIds = new[] { "client-a", "client-b" };
+        var handshakeRequest = new ProtocolEnvelope(
+            ProtocolMessageType.HandshakeRequest,
+            10,
+            new HandshakeRequest { PlayerName = "Client A" }.ToPayload());
+        var clientFrame = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(handshakeRequest));
+        var hostFrame = RelayRouting.FromClient("client-a", clientFrame);
+        var sourceRoute = RelayRoute.FromPayload(hostFrame.Payload);
+
+        Assert(hostFrame.Type == RelayFrameType.RoutedProtocol, "client frame was not routed to host");
+        Assert(sourceRoute.ConnectionId == "client-a", "client source ID was not exposed to host");
+        Assert(
+            ProtocolSerializer.Unpack(sourceRoute.ProtocolPayload).Type == ProtocolMessageType.HandshakeRequest,
+            "routed handshake payload changed");
+
+        var accepted = new ProtocolEnvelope(
+            ProtocolMessageType.HandshakeAccepted,
+            11,
+            new HandshakeResponse { Accepted = true, AssignedPlayerId = 2 }.ToPayload());
+        var targetedResponse = RelayRouting.ToClient("client-a", ProtocolSerializer.Pack(accepted));
+        var responseRecipients = RelayRouting.SelectHostRecipients(targetedResponse, clientIds);
+        Assert(responseRecipients.SequenceEqual(new[] { "client-a" }), "handshake response leaked to another client");
+
+        var snapshot = new ProtocolEnvelope(
+            ProtocolMessageType.SnapshotChunk,
+            12,
+            Encoding.UTF8.GetBytes("client-a-snapshot"));
+        var targetedSnapshot = RelayRouting.ToClient("client-a", ProtocolSerializer.Pack(snapshot));
+        var snapshotRecipients = RelayRouting.SelectHostRecipients(targetedSnapshot, clientIds);
+        Assert(snapshotRecipients.SequenceEqual(new[] { "client-a" }), "snapshot frame leaked to another client");
+        var deliveredSnapshot = ProtocolSerializer.Unpack(RelayRouting.ForClient(targetedSnapshot).Payload);
+        Assert(deliveredSnapshot.Type == ProtocolMessageType.SnapshotChunk, "targeted frame was not unwrapped for client");
+
+        var clientBResponse = RelayRouting.ToClient("client-b", ProtocolSerializer.Pack(accepted));
+        Assert(
+            RelayRouting.SelectHostRecipients(clientBResponse, clientIds).SequenceEqual(new[] { "client-b" }),
+            "second client response was not independently routed");
+
+        var gameplay = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, 13, Array.Empty<byte>());
+        var broadcast = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(gameplay));
+        Assert(
+            RelayRouting.SelectHostRecipients(broadcast, clientIds).SequenceEqual(clientIds),
+            "broadcast gameplay did not reach every client");
+
+        var staleTarget = RelayRouting.ToClient("client-c", ProtocolSerializer.Pack(accepted));
+        Assert(
+            RelayRouting.SelectHostRecipients(staleTarget, clientIds).Count == 0,
+            "unknown connection ID escaped the room routing table");
     }
 
     private static void Assert(bool condition, string message)
