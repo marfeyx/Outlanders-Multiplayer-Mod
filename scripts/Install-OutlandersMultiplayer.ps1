@@ -11,10 +11,6 @@ if (-not (Test-Path (Join-Path $GamePath "Outlanders.exe"))) {
     throw "Outlanders.exe was not found in '$GamePath'."
 }
 
-if (-not (Test-Path (Join-Path $melonSource "version.dll"))) {
-    throw "MelonLoader v0.7.3 was not found at '$melonSource'."
-}
-
 & (Join-Path $PSScriptRoot "Build-Package.ps1") -Configuration $Configuration
 
 if (-not (Test-Path (Join-Path $GamePath "MelonLoader"))) {
