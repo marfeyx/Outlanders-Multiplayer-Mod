@@ -20,6 +20,7 @@ public static class TestRunner
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
+            ("multiplayer snapshots register without overwriting saves", MultiplayerSnapshotsRegisterWithoutOverwritingSaves),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
             ("join code contains relay room and secret", JoinCodeRoundTrips)
         };
@@ -126,6 +127,57 @@ public static class TestRunner
 
         Assert(frame.Type == RelayFrameType.Protocol, "relay frame type mismatch");
         Assert(restored.Sequence == 7, "relay protocol sequence mismatch");
+    }
+
+    private static void MultiplayerSnapshotsRegisterWithoutOverwritingSaves()
+    {
+        var testRoot = Path.Combine(Path.GetTempPath(), "OutlandersMultiplayerTests", Guid.NewGuid().ToString("N"));
+        try
+        {
+            var userFolder = Path.Combine(testRoot, "user-test");
+            var saveGameFolder = Path.Combine(userFolder, "123456789");
+            var endlessFolder = Path.Combine(saveGameFolder, "Endless");
+            Directory.CreateDirectory(endlessFolder);
+            File.WriteAllBytes(Path.Combine(userFolder, "savegame-123456789"), new byte[] { 1 });
+            var normalSavePath = Path.Combine(endlessFolder, "Endless_0.dat");
+            var normalSaveBytes = Encoding.UTF8.GetBytes("normal-save");
+            File.WriteAllBytes(normalSavePath, normalSaveBytes);
+            File.WriteAllBytes(normalSavePath + ".meta", new byte[] { 2 });
+
+            var firstSnapshot = Encoding.UTF8.GetBytes("host-world-a");
+            var first = MultiplayerSaveRegistrar.Register(userFolder, firstSnapshot);
+            Assert(first.SlotIndex == 1, "existing Endless slot was not skipped");
+            Assert(Path.GetFileName(first.Path) == "Endless_1.dat", "registered slot name was not loadable");
+            Assert(File.ReadAllBytes(first.Path).SequenceEqual(firstSnapshot), "registered snapshot bytes changed");
+            Assert(File.ReadAllBytes(normalSavePath).SequenceEqual(normalSaveBytes), "normal save was overwritten");
+
+            var secondSnapshot = Encoding.UTF8.GetBytes("host-world-b");
+            var second = MultiplayerSaveRegistrar.Register(userFolder, secondSnapshot);
+            Assert(second.SlotIndex == 2, "second snapshot replaced an existing multiplayer slot");
+            Assert(File.ReadAllBytes(first.Path).SequenceEqual(firstSnapshot), "first multiplayer slot was overwritten");
+
+            var secondSaveGameFolder = Path.Combine(userFolder, "987654321");
+            Directory.CreateDirectory(secondSaveGameFolder);
+            File.WriteAllBytes(Path.Combine(userFolder, "savegame-987654321"), new byte[] { 3 });
+            var rejectedAmbiguousProfile = false;
+            try
+            {
+                MultiplayerSaveRegistrar.Register(userFolder, Encoding.UTF8.GetBytes("must-not-be-written"));
+            }
+            catch (InvalidOperationException ex)
+            {
+                rejectedAmbiguousProfile = ex.Message.Contains("Multiple Outlanders save games", StringComparison.Ordinal);
+            }
+
+            Assert(rejectedAmbiguousProfile, "ambiguous profile selection was not rejected");
+        }
+        finally
+        {
+            if (Directory.Exists(testRoot))
+            {
+                Directory.Delete(testRoot, recursive: true);
+            }
+        }
     }
 
     private static void JoinCodeRoundTrips()

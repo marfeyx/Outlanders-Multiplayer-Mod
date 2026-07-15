@@ -49,7 +49,9 @@ public sealed class MultiplayerOverlay
         const float y0 = 24f;
         const float width = 468f;
         const float pad = 14f;
-        var panelHeight = _showAdvanced ? 548f : 398f;
+        var requiredAction = _controller.State.RequiredAction;
+        var actionHeight = string.IsNullOrWhiteSpace(requiredAction) ? 0f : 62f;
+        var panelHeight = (_showAdvanced ? 548f : 398f) + actionHeight;
         var formHeight = _showAdvanced ? 356f : 208f;
         var y = y0;
 
@@ -67,6 +69,14 @@ public sealed class MultiplayerOverlay
         y += 86;
         DrawStatusStrip(x + pad, y, width - pad * 2);
         y += 52;
+
+        if (actionHeight > 0)
+        {
+            DrawBox(x + pad, y, width - pad * 2, 50, 0.24f, 0.31f, 0.22f, " ");
+            DrawLabel(x + pad + 12, y + 5, width - 52, 18, "Host world ready", 0.92f, 0.91f, 0.76f);
+            DrawLabel(x + pad + 12, y + 25, width - 52, 18, requiredAction, 0.82f, 0.86f, 0.72f);
+            y += actionHeight;
+        }
 
         DrawBox(x + pad, y, width - pad * 2, formHeight, 0.21f, 0.23f, 0.19f, " ");
         y += 14;
