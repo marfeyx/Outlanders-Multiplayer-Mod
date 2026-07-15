@@ -49,7 +49,7 @@ public sealed class MultiplayerOverlay
         const float y0 = 24f;
         const float width = 468f;
         const float pad = 14f;
-        var panelHeight = _showAdvanced ? 548f : 398f;
+        var panelHeight = _showAdvanced ? 616f : 466f;
         var formHeight = _showAdvanced ? 356f : 208f;
         var y = y0;
 
@@ -67,6 +67,9 @@ public sealed class MultiplayerOverlay
         y += 86;
         DrawStatusStrip(x + pad, y, width - pad * 2);
         y += 52;
+
+        DrawHostingSaveStrip(x + pad, y, width - pad * 2);
+        y += 68;
 
         DrawBox(x + pad, y, width - pad * 2, formHeight, 0.21f, 0.23f, 0.19f, " ");
         y += 14;
@@ -142,6 +145,28 @@ public sealed class MultiplayerOverlay
         DrawBox(x, y, width, 38, hasError ? 0.38f : 0.23f, hasError ? 0.18f : 0.30f, hasError ? 0.16f : 0.23f, " ");
         DrawBox(x + 12, y + 11, 14, 14, hasError ? 0.72f : 0.42f, hasError ? 0.28f : 0.62f, hasError ? 0.20f : 0.35f, " ");
         DrawLabel(x + 34, y + 8, width - 44, 22, hasError ? _controller.State.LastError : _controller.State.StatusText, 0.97f, 0.94f, 0.84f);
+    }
+
+    private void DrawHostingSaveStrip(float x, float y, float width)
+    {
+        DrawBox(x, y, width, 54, 0.20f, 0.25f, 0.20f, " ");
+        DrawLabel(x + 12, y + 5, width - 156, 20, "Hosting save", 0.78f, 0.82f, 0.70f);
+        DrawLabel(x + 12, y + 26, width - 156, 20, _controller.HostingSaveDisplayPath, 0.97f, 0.94f, 0.84f);
+
+        if (DrawButton(x + width - 136, y + 12, 28, 30, "<", 0.30f, 0.36f, 0.28f))
+        {
+            _controller.SelectPreviousHostingSave();
+        }
+
+        if (DrawButton(x + width - 102, y + 12, 28, 30, ">", 0.30f, 0.36f, 0.28f))
+        {
+            _controller.SelectNextHostingSave();
+        }
+
+        if (DrawButton(x + width - 68, y + 12, 58, 30, "Refresh", 0.29f, 0.34f, 0.27f))
+        {
+            _controller.RefreshHostingSaveSelection();
+        }
     }
 
     private void DrawField(float x, float y, string label, ref string value, int maxLength)

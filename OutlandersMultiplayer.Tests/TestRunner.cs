@@ -20,6 +20,7 @@ public static class TestRunner
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
+            ("hosting save selection excludes unsafe paths", HostingSaveSelectionExcludesUnsafePaths),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
             ("join code contains relay room and secret", JoinCodeRoundTrips)
         };
@@ -100,6 +101,65 @@ public static class TestRunner
         }
 
         Assert(rejected, "corrupt snapshot should be rejected");
+    }
+
+    private static void HostingSaveSelectionExcludesUnsafePaths()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"OutlandersMultiplayer.SaveSelection.{Guid.NewGuid():N}");
+        try
+        {
+            var firstUser = Directory.CreateDirectory(Path.Combine(root, "user-first")).FullName;
+            var secondUser = Directory.CreateDirectory(Path.Combine(root, "user-second")).FullName;
+            var activeSave = WriteSave(firstUser, "Endless_Active.dat", "active", DateTime.UtcNow.AddHours(-4));
+            var otherUserSave = WriteSave(secondUser, "Endless_Other.dat", "other", DateTime.UtcNow.AddHours(-1));
+            var staleFolder = Directory.CreateDirectory(Path.Combine(firstUser, "Backups")).FullName;
+            var staleSave = WriteSave(staleFolder, "Endless_Stale.dat", "stale", DateTime.UtcNow);
+            var tempFolder = Directory.CreateDirectory(Path.Combine(firstUser, TempSaveWriter.MultiplayerSlotFolder)).FullName;
+            var tempSave = WriteSave(tempFolder, "Endless_Temp.dat", "temp", DateTime.UtcNow.AddHours(1));
+            WriteSave(firstUser, "Endless_Active.dat.backup", "backup", DateTime.UtcNow.AddHours(2));
+
+            var activeSelection = HostingSaveSelector.Discover(root, activeSave);
+            Assert(activeSelection.SelectedPath == activeSave, "active normal save should be preferred across users");
+            Assert(activeSelection.Candidates.Count == 2, "only top-level normal saves should be eligible");
+            Assert(activeSelection.Candidates.Contains(activeSave), "active save is missing from candidates");
+            Assert(activeSelection.Candidates.Contains(otherUserSave), "other user's normal save should remain explicitly selectable");
+            Assert(!activeSelection.Candidates.Contains(staleSave), "backup-folder save should not be eligible");
+            Assert(!activeSelection.Candidates.Contains(tempSave), "multiplayer temp save should not be eligible");
+
+            var ambiguousSelection = HostingSaveSelector.Discover(root);
+            Assert(ambiguousSelection.SelectedPath == null, "multiple saves should require explicit selection");
+            Assert(ambiguousSelection.Error.Contains("Select the exact save", StringComparison.Ordinal), "ambiguous selection should explain how to proceed");
+
+            var tempSelection = HostingSaveSelector.Discover(root, tempSave);
+            Assert(tempSelection.SelectedPath == null, "temp save must not be accepted as active");
+            Assert(tempSelection.Error.Contains("not an eligible", StringComparison.Ordinal), "invalid active save should produce a clear error");
+
+            var missingSelection = HostingSaveSelector.Discover(root, Path.Combine(firstUser, "Endless_Missing.dat"));
+            Assert(missingSelection.SelectedPath == null, "missing active save must not be accepted");
+            Assert(missingSelection.Error.Contains("not an eligible", StringComparison.Ordinal), "missing active save should produce a clear error");
+
+            var singleRoot = Directory.CreateDirectory(Path.Combine(root, "single-root")).FullName;
+            var singleUser = Directory.CreateDirectory(Path.Combine(singleRoot, "user-only")).FullName;
+            var onlySave = WriteSave(singleUser, "Endless_Only.dat", "only", DateTime.UtcNow);
+            var singleSelection = HostingSaveSelector.Discover(singleRoot);
+            Assert(singleSelection.SelectedPath == onlySave, "one normal save should be selected without extra confirmation");
+            Assert(string.IsNullOrEmpty(singleSelection.Error), "single-save selection should not report an error");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static string WriteSave(string folder, string fileName, string contents, DateTime lastWriteUtc)
+    {
+        var path = Path.Combine(folder, fileName);
+        File.WriteAllText(path, contents);
+        File.SetLastWriteTimeUtc(path, lastWriteUtc);
+        return Path.GetFullPath(path);
     }
 
     private static void RelayFramesRoundTrip()
