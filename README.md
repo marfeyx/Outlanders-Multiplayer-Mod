@@ -100,6 +100,14 @@ If you prefer running the DLL:
 dotnet .\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.dll 17668
 ```
 
+The optional second and third arguments set the initial join-handshake timeout and the later client-read timeout in seconds. Defaults are 10 seconds and 120 seconds:
+
+```powershell
+.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668 10 120
+```
+
+Connections that do not send a complete join frame or stop sending frames after joining are closed without stopping the relay or disconnecting other rooms.
+
 Firewall requirement:
 
 - Relay server must allow inbound TCP `17668`.

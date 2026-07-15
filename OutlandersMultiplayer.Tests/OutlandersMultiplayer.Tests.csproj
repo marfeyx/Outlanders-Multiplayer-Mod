@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\OutlandersMultiplayer.Core\OutlandersMultiplayer.Core.csproj" />
+    <Compile Include="..\OutlandersMultiplayer.RelayServer\RelayServer.cs" Link="RelayServer.cs" />
   </ItemGroup>
 
   <ItemGroup>
