@@ -22,7 +22,10 @@ public static class TestRunner
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("hosting save selection excludes unsafe paths", HostingSaveSelectionExcludesUnsafePaths),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
-            ("join code contains relay room and secret", JoinCodeRoundTrips)
+            ("relay frames tolerate fragmented reads", RelayFramesTolerateFragmentedReads),
+            ("relay frames reject truncated bodies", RelayFramesRejectTruncatedBodies),
+            ("join code contains relay room and secret", JoinCodeRoundTrips),
+            ("join code escapes delimiters and backslashes", JoinCodeSpecialCharactersRoundTrip)
         };
 
         var failed = 0;
@@ -188,6 +191,45 @@ public static class TestRunner
         Assert(restored.Sequence == 7, "relay protocol sequence mismatch");
     }
 
+    private static void RelayFramesTolerateFragmentedReads()
+    {
+        var payload = Encoding.UTF8.GetBytes("fragmented relay payload");
+        var bytes = SerializeRelayFrame(new RelayFrame(RelayFrameType.Protocol, payload));
+        using var stream = new ChunkedReadStream(bytes, maxChunkSize: 2);
+
+        var restored = RelayFrame.Read(stream);
+
+        Assert(restored.Type == RelayFrameType.Protocol, "fragmented relay frame type mismatch");
+        Assert(restored.Payload.SequenceEqual(payload), "fragmented relay frame payload mismatch");
+    }
+
+    private static void RelayFramesRejectTruncatedBodies()
+    {
+        var bytes = SerializeRelayFrame(new RelayFrame(RelayFrameType.Protocol, Encoding.UTF8.GetBytes("complete payload")));
+        var declaredLength = BitConverter.ToInt32(bytes, 0);
+        BitConverter.GetBytes(declaredLength + 5).CopyTo(bytes, 0);
+
+        var rejected = false;
+        using var stream = new ChunkedReadStream(bytes, maxChunkSize: 3);
+        try
+        {
+            RelayFrame.Read(stream);
+        }
+        catch (EndOfStreamException ex)
+        {
+            rejected = ex.Message.Contains("relay frame body", StringComparison.Ordinal);
+        }
+
+        Assert(rejected, "relay frame with a truncated body should fail with a deterministic EOF error");
+    }
+
+    private static byte[] SerializeRelayFrame(RelayFrame frame)
+    {
+        using var stream = new MemoryStream();
+        RelayFrame.Write(stream, frame);
+        return stream.ToArray();
+    }
+
     private static void JoinCodeRoundTrips()
     {
         var code = JoinCode.Encode("relay.example.net", 17668, "ROOM123", "SECRET456");
@@ -199,11 +241,71 @@ public static class TestRunner
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
     }
 
+    private static void JoinCodeSpecialCharactersRoundTrip()
+    {
+        const string relayHost = @"relay|host\edge";
+        const string roomCode = @"ROOM\1|A";
+        const string sessionKey = @"SECRET|456\p";
+
+        var code = JoinCode.Encode(relayHost, 17668, roomCode, sessionKey);
+        Assert(JoinCode.TryDecode(code, out var decoded), "join code with special characters should decode");
+        Assert(decoded.RelayHost == relayHost, "escaped relay host mismatch");
+        Assert(decoded.RelayPort == 17668, "escaped join code relay port mismatch");
+        Assert(decoded.RoomCode == roomCode, "escaped room code mismatch");
+        Assert(decoded.SessionKey == sessionKey, "escaped session key mismatch");
+    }
+
     private static void Assert(bool condition, string message)
     {
         if (!condition)
         {
             throw new InvalidOperationException(message);
         }
+    }
+}
+
+internal sealed class ChunkedReadStream : Stream
+{
+    private readonly MemoryStream _inner;
+    private readonly int _maxChunkSize;
+
+    public ChunkedReadStream(byte[] bytes, int maxChunkSize)
+    {
+        _inner = new MemoryStream(bytes, writable: false);
+        _maxChunkSize = maxChunkSize;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => _inner.Length;
+
+    public override long Position
+    {
+        get => _inner.Position;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        return _inner.Read(buffer, offset, Math.Min(count, _maxChunkSize));
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _inner.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 }
