@@ -31,7 +31,7 @@ public sealed class JoinCode
         {
             var encoded = code.Trim().Substring(Prefix.Length);
             var raw = Encoding.UTF8.GetString(FromBase64Url(encoded));
-            var parts = SplitEscaped(raw);
+            var parts = SplitAndUnescape(raw);
             if (parts.Length != 4 || !int.TryParse(parts[1], out var port) || port <= 0)
             {
                 return false;
@@ -39,10 +39,10 @@ public sealed class JoinCode
 
             joinCode = new JoinCode
             {
-                RelayHost = Unescape(parts[0]),
+                RelayHost = parts[0],
                 RelayPort = port,
-                RoomCode = Unescape(parts[2]),
-                SessionKey = Unescape(parts[3])
+                RoomCode = parts[2],
+                SessionKey = parts[3]
             };
             return !string.IsNullOrWhiteSpace(joinCode.RelayHost)
                 && !string.IsNullOrWhiteSpace(joinCode.RoomCode)
@@ -101,12 +101,7 @@ public sealed class JoinCode
         return (value ?? string.Empty).Replace("\\", "\\\\").Replace("|", "\\p");
     }
 
-    private static string Unescape(string value)
-    {
-        return (value ?? string.Empty).Replace("\\p", "|").Replace("\\\\", "\\");
-    }
-
-    private static string[] SplitEscaped(string value)
+    private static string[] SplitAndUnescape(string value)
     {
         var parts = new System.Collections.Generic.List<string>();
         var current = new StringBuilder();
@@ -115,8 +110,20 @@ public sealed class JoinCode
         {
             if (escaped)
             {
-                current.Append('\\');
-                current.Append(ch);
+                if (ch == 'p')
+                {
+                    current.Append('|');
+                }
+                else if (ch == '\\')
+                {
+                    current.Append('\\');
+                }
+                else
+                {
+                    current.Append('\\');
+                    current.Append(ch);
+                }
+
                 escaped = false;
                 continue;
             }
@@ -135,6 +142,11 @@ public sealed class JoinCode
             }
 
             current.Append(ch);
+        }
+
+        if (escaped)
+        {
+            current.Append('\\');
         }
 
         parts.Add(current.ToString());

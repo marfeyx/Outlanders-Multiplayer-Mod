@@ -1,11 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using OutlandersMultiplayer.Core.Protocol;
 using OutlandersMultiplayer.Core.Relay;
+using OutlandersMultiplayer.Core.Session;
 using OutlandersMultiplayer.Core.Snapshots;
 using OutlandersMultiplayer.Core.State;
 using RelayServerHost = OutlandersMultiplayer.RelayServer.RelayServer;
@@ -23,9 +27,15 @@ public static class TestRunner
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
+            ("hosting save selection excludes unsafe paths", HostingSaveSelectionExcludesUnsafePaths),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
             ("relay disconnects idle clients and remains available", RelayDisconnectsIdleClientsAndRemainsAvailable),
-            ("join code contains relay room and secret", JoinCodeRoundTrips)
+            ("relay connection times out without blocking", RelayConnectionTimesOutWithoutBlocking),
+            ("relay connection sends join frame asynchronously", RelayConnectionSendsJoinFrameAsynchronously),
+            ("relay frames tolerate fragmented reads", RelayFramesTolerateFragmentedReads),
+            ("relay frames reject truncated bodies", RelayFramesRejectTruncatedBodies),
+            ("join code contains relay room and secret", JoinCodeRoundTrips),
+            ("join code escapes delimiters and backslashes", JoinCodeSpecialCharactersRoundTrip)
         };
 
         var failed = 0;
@@ -106,6 +116,65 @@ public static class TestRunner
         Assert(rejected, "corrupt snapshot should be rejected");
     }
 
+    private static void HostingSaveSelectionExcludesUnsafePaths()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"OutlandersMultiplayer.SaveSelection.{Guid.NewGuid():N}");
+        try
+        {
+            var firstUser = Directory.CreateDirectory(Path.Combine(root, "user-first")).FullName;
+            var secondUser = Directory.CreateDirectory(Path.Combine(root, "user-second")).FullName;
+            var activeSave = WriteSave(firstUser, "Endless_Active.dat", "active", DateTime.UtcNow.AddHours(-4));
+            var otherUserSave = WriteSave(secondUser, "Endless_Other.dat", "other", DateTime.UtcNow.AddHours(-1));
+            var staleFolder = Directory.CreateDirectory(Path.Combine(firstUser, "Backups")).FullName;
+            var staleSave = WriteSave(staleFolder, "Endless_Stale.dat", "stale", DateTime.UtcNow);
+            var tempFolder = Directory.CreateDirectory(Path.Combine(firstUser, TempSaveWriter.MultiplayerSlotFolder)).FullName;
+            var tempSave = WriteSave(tempFolder, "Endless_Temp.dat", "temp", DateTime.UtcNow.AddHours(1));
+            WriteSave(firstUser, "Endless_Active.dat.backup", "backup", DateTime.UtcNow.AddHours(2));
+
+            var activeSelection = HostingSaveSelector.Discover(root, activeSave);
+            Assert(activeSelection.SelectedPath == activeSave, "active normal save should be preferred across users");
+            Assert(activeSelection.Candidates.Count == 2, "only top-level normal saves should be eligible");
+            Assert(activeSelection.Candidates.Contains(activeSave), "active save is missing from candidates");
+            Assert(activeSelection.Candidates.Contains(otherUserSave), "other user's normal save should remain explicitly selectable");
+            Assert(!activeSelection.Candidates.Contains(staleSave), "backup-folder save should not be eligible");
+            Assert(!activeSelection.Candidates.Contains(tempSave), "multiplayer temp save should not be eligible");
+
+            var ambiguousSelection = HostingSaveSelector.Discover(root);
+            Assert(ambiguousSelection.SelectedPath == null, "multiple saves should require explicit selection");
+            Assert(ambiguousSelection.Error.Contains("Select the exact save", StringComparison.Ordinal), "ambiguous selection should explain how to proceed");
+
+            var tempSelection = HostingSaveSelector.Discover(root, tempSave);
+            Assert(tempSelection.SelectedPath == null, "temp save must not be accepted as active");
+            Assert(tempSelection.Error.Contains("not an eligible", StringComparison.Ordinal), "invalid active save should produce a clear error");
+
+            var missingSelection = HostingSaveSelector.Discover(root, Path.Combine(firstUser, "Endless_Missing.dat"));
+            Assert(missingSelection.SelectedPath == null, "missing active save must not be accepted");
+            Assert(missingSelection.Error.Contains("not an eligible", StringComparison.Ordinal), "missing active save should produce a clear error");
+
+            var singleRoot = Directory.CreateDirectory(Path.Combine(root, "single-root")).FullName;
+            var singleUser = Directory.CreateDirectory(Path.Combine(singleRoot, "user-only")).FullName;
+            var onlySave = WriteSave(singleUser, "Endless_Only.dat", "only", DateTime.UtcNow);
+            var singleSelection = HostingSaveSelector.Discover(singleRoot);
+            Assert(singleSelection.SelectedPath == onlySave, "one normal save should be selected without extra confirmation");
+            Assert(string.IsNullOrEmpty(singleSelection.Error), "single-save selection should not report an error");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static string WriteSave(string folder, string fileName, string contents, DateTime lastWriteUtc)
+    {
+        var path = Path.Combine(folder, fileName);
+        File.WriteAllText(path, contents);
+        File.SetLastWriteTimeUtc(path, lastWriteUtc);
+        return Path.GetFullPath(path);
+    }
+
     private static void RelayFramesRoundTrip()
     {
         var join = new RelayJoinRequest
@@ -130,6 +199,139 @@ public static class TestRunner
 
         Assert(frame.Type == RelayFrameType.Protocol, "relay frame type mismatch");
         Assert(restored.Sequence == 7, "relay protocol sequence mismatch");
+    }
+
+    private static void RelayConnectionTimesOutWithoutBlocking()
+    {
+        var neverCompletes = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var transport = new TcpRelayTransport(
+            TimeSpan.FromMilliseconds(75),
+            (_, _, _) => neverCompletes.Task);
+        var state = new SessionState();
+        var callbackThread = -1;
+        string? failure = null;
+        transport.ConnectionFailed += message =>
+        {
+            callbackThread = Thread.CurrentThread.ManagedThreadId;
+            failure = message;
+            state.SetError(message);
+        };
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            failure = null;
+            state.SetStatus(SessionStatus.Joining, "Connecting to relay...");
+            var stopwatch = Stopwatch.StartNew();
+            transport.Connect("unreachable.test", 17668, CreateRelayJoinRequest());
+            stopwatch.Stop();
+
+            Assert(stopwatch.Elapsed < TimeSpan.FromMilliseconds(500), "relay Connect should return immediately");
+            Assert(transport.IsConnecting, "relay transport should report connection progress");
+            if (attempt == 0)
+            {
+                Thread.Sleep(150);
+                Assert(failure == null, "relay failure callbacks should wait for Poll");
+                Assert(state.Status == SessionStatus.Joining, "session should show connection progress until Poll handles failure");
+            }
+
+            WaitUntil(() => failure != null, TimeSpan.FromSeconds(2), transport.Poll, "relay timeout callback was not delivered");
+            Assert(failure!.Contains("timed out", StringComparison.OrdinalIgnoreCase), "relay timeout should be actionable");
+            Assert(state.Status == SessionStatus.Error, "relay timeout should become a recoverable session error");
+            Assert(callbackThread == Thread.CurrentThread.ManagedThreadId, "relay failure callback should run from Poll");
+            WaitUntil(() => transport.ActiveWorkerCount == 0, TimeSpan.FromSeconds(2), () => { }, "relay timeout worker did not terminate");
+            Assert(!transport.IsConnecting && !transport.IsRunning, "failed relay attempt should release its connection state");
+        }
+    }
+
+    private static void RelayConnectionSendsJoinFrameAsynchronously()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var acceptTask = listener.AcceptTcpClientAsync();
+        using var transport = new TcpRelayTransport(TimeSpan.FromSeconds(2));
+        var connected = false;
+        string? failure = null;
+        transport.Connected += () => connected = true;
+        transport.ConnectionFailed += message => failure = message;
+
+        transport.Connect("127.0.0.1", port, CreateRelayJoinRequest());
+        WaitUntil(() => connected || failure != null, TimeSpan.FromSeconds(2), transport.Poll, "relay connection callback was not delivered");
+        Assert(connected, $"loopback relay should connect successfully: {failure}");
+
+        using var serverClient = acceptTask.GetAwaiter().GetResult();
+        var joinFrame = RelayFrame.Read(serverClient.GetStream());
+        var joinRequest = RelayJoinRequest.FromPayload(joinFrame.Payload);
+        Assert(joinFrame.Type == RelayFrameType.Join, "relay connection should send a join frame first");
+        Assert(joinRequest.Role == RelayRole.Client, "relay join role mismatch");
+        Assert(joinRequest.RoomCode == "ROOM123", "relay join room mismatch");
+
+        transport.Stop();
+        WaitUntil(() => transport.ActiveWorkerCount == 0, TimeSpan.FromSeconds(2), () => { }, "stopped relay worker did not terminate");
+        Assert(!transport.IsConnecting && !transport.IsRunning, "stopped relay should release its socket state");
+    }
+
+    private static RelayJoinRequest CreateRelayJoinRequest()
+    {
+        return new RelayJoinRequest
+        {
+            Role = RelayRole.Client,
+            RoomCode = "ROOM123",
+            SessionKey = "secret",
+            PlayerName = "Test Player"
+        };
+    }
+
+    private static void WaitUntil(Func<bool> condition, TimeSpan timeout, Action tick, string failureMessage)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!condition() && stopwatch.Elapsed < timeout)
+        {
+            tick();
+            Thread.Sleep(5);
+        }
+
+        tick();
+        Assert(condition(), failureMessage);
+    }
+
+    private static void RelayFramesTolerateFragmentedReads()
+    {
+        var payload = Encoding.UTF8.GetBytes("fragmented relay payload");
+        var bytes = SerializeRelayFrame(new RelayFrame(RelayFrameType.Protocol, payload));
+        using var stream = new ChunkedReadStream(bytes, maxChunkSize: 2);
+
+        var restored = RelayFrame.Read(stream);
+
+        Assert(restored.Type == RelayFrameType.Protocol, "fragmented relay frame type mismatch");
+        Assert(restored.Payload.SequenceEqual(payload), "fragmented relay frame payload mismatch");
+    }
+
+    private static void RelayFramesRejectTruncatedBodies()
+    {
+        var bytes = SerializeRelayFrame(new RelayFrame(RelayFrameType.Protocol, Encoding.UTF8.GetBytes("complete payload")));
+        var declaredLength = BitConverter.ToInt32(bytes, 0);
+        BitConverter.GetBytes(declaredLength + 5).CopyTo(bytes, 0);
+
+        var rejected = false;
+        using var stream = new ChunkedReadStream(bytes, maxChunkSize: 3);
+        try
+        {
+            RelayFrame.Read(stream);
+        }
+        catch (EndOfStreamException ex)
+        {
+            rejected = ex.Message.Contains("relay frame body", StringComparison.Ordinal);
+        }
+
+        Assert(rejected, "relay frame with a truncated body should fail with a deterministic EOF error");
+    }
+
+    private static byte[] SerializeRelayFrame(RelayFrame frame)
+    {
+        using var stream = new MemoryStream();
+        RelayFrame.Write(stream, frame);
+        return stream.ToArray();
     }
 
     private static void JoinCodeRoundTrips()
@@ -235,11 +437,71 @@ public static class TestRunner
         }
     }
 
+    private static void JoinCodeSpecialCharactersRoundTrip()
+    {
+        const string relayHost = @"relay|host\edge";
+        const string roomCode = @"ROOM\1|A";
+        const string sessionKey = @"SECRET|456\p";
+
+        var code = JoinCode.Encode(relayHost, 17668, roomCode, sessionKey);
+        Assert(JoinCode.TryDecode(code, out var decoded), "join code with special characters should decode");
+        Assert(decoded.RelayHost == relayHost, "escaped relay host mismatch");
+        Assert(decoded.RelayPort == 17668, "escaped join code relay port mismatch");
+        Assert(decoded.RoomCode == roomCode, "escaped room code mismatch");
+        Assert(decoded.SessionKey == sessionKey, "escaped session key mismatch");
+    }
+
     private static void Assert(bool condition, string message)
     {
         if (!condition)
         {
             throw new InvalidOperationException(message);
         }
+    }
+}
+
+internal sealed class ChunkedReadStream : Stream
+{
+    private readonly MemoryStream _inner;
+    private readonly int _maxChunkSize;
+
+    public ChunkedReadStream(byte[] bytes, int maxChunkSize)
+    {
+        _inner = new MemoryStream(bytes, writable: false);
+        _maxChunkSize = maxChunkSize;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => _inner.Length;
+
+    public override long Position
+    {
+        get => _inner.Position;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        return _inner.Read(buffer, offset, Math.Min(count, _maxChunkSize));
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _inner.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 }
