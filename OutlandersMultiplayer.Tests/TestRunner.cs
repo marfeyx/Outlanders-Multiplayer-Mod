@@ -128,7 +128,7 @@ public static class TestRunner
             var otherUserSave = WriteSave(secondUser, "Endless_Other.dat", "other", DateTime.UtcNow.AddHours(-1));
             var staleFolder = Directory.CreateDirectory(Path.Combine(firstUser, "Backups")).FullName;
             var staleSave = WriteSave(staleFolder, "Endless_Stale.dat", "stale", DateTime.UtcNow);
-            var tempFolder = Directory.CreateDirectory(Path.Combine(firstUser, TempSaveWriter.MultiplayerSlotFolder)).FullName;
+            var tempFolder = Directory.CreateDirectory(Path.Combine(firstUser, "OutlandersMultiplayerTemp")).FullName;
             var tempSave = WriteSave(tempFolder, "Endless_Temp.dat", "temp", DateTime.UtcNow.AddHours(1));
             WriteSave(firstUser, "Endless_Active.dat.backup", "backup", DateTime.UtcNow.AddHours(2));
 
