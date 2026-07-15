@@ -11,5 +11,6 @@ public enum ProtocolMessageType : byte
     AcceptedCommand = 7,
     StateHash = 8,
     TextStatus = 9,
-    DisconnectNotice = 10
+    DisconnectNotice = 10,
+    SnapshotStateHash = 11
 }

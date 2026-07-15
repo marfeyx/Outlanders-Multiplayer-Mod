@@ -14,7 +14,9 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Sends the host's latest `Endless_*.dat` save as a compressed snapshot.
 - Writes client snapshots only into `OutlandersMultiplayerTemp`.
 - Does not overwrite normal Outlanders save slots.
-- Live build orders, villagers, resources, decrees, and time sync are not complete yet.
+- Build placement is captured from `SitePlacementSystem.PlaceOneSite`, validated by the host, and applied on every peer through the same game method.
+- Direct and relay sessions carry validated player intents, host-assigned commands, and per-tick state hashes.
+- Build cancellation, villagers, resources, decrees, and time sync are not complete yet.
 
 ## Fast Install
 
@@ -87,6 +89,8 @@ Your friend should not need to type relay host, relay port, session key, or room
 ## Running The Relay Server
 
 Relay mode is what makes worldwide play possible without port forwarding on the host's home router.
+
+The relay assigns each joined client a connection ID within its room. Handshake responses and snapshot frames use that ID to reach only the joining client, while host gameplay frames sent without a target are broadcast to every client in the room.
 
 Run this on a VPS, cloud VM, rented server, or any computer that has a public TCP port:
 
@@ -198,9 +202,7 @@ artifacts\OutlandersMultiplayer\RelayServer\
 
 ## Next Development Work
 
-- Finish IL2CPP instrumentation for the exact Outlanders gameplay methods.
-- Patch build, demolish, cancel, priority, work-slot, decree, and time-speed actions.
-- Convert client actions into network intents.
-- Apply host-approved commands through the same game methods local play uses.
-- Add deterministic state hashes for resources, buildings, day/time, construction progress, and villagers.
+- Extend the concrete IL2CPP hooks from build placement to demolish, cancel, priority, work-slot, decree, and time-speed actions.
+- Route the remaining action categories through `SendPlayerIntent` and `AcceptedCommandReceived`.
+- Publish deterministic hashes for resources, buildings, day/time, construction progress, and villagers through `PublishStateHash`.
 - Add corrective resync when clients diverge from the host.

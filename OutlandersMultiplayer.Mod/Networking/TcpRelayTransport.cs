@@ -10,7 +10,7 @@ namespace OutlandersMultiplayer.Mod.Networking;
 
 public sealed class TcpRelayTransport : IDisposable
 {
-    private readonly ConcurrentQueue<ProtocolEnvelope> _incoming = new();
+    private readonly ConcurrentQueue<IncomingProtocol> _incoming = new();
     private readonly object _sendLock = new();
     private TcpClient? _client;
     private NetworkStream? _stream;
@@ -19,7 +19,7 @@ public sealed class TcpRelayTransport : IDisposable
 
     public event Action? Connected;
     public event Action<string>? Disconnected;
-    public event Action<ProtocolEnvelope>? MessageReceived;
+    public event Action<string, ProtocolEnvelope>? MessageReceived;
     public event Action<string>? StatusReceived;
     public event Action<string>? Rejected;
 
@@ -47,13 +47,23 @@ public sealed class TcpRelayTransport : IDisposable
 
     public void Poll()
     {
-        while (_incoming.TryDequeue(out var envelope))
+        while (_incoming.TryDequeue(out var incoming))
         {
-            MessageReceived?.Invoke(envelope);
+            MessageReceived?.Invoke(incoming.ConnectionId, incoming.Envelope);
         }
     }
 
     public void Send(ProtocolEnvelope envelope)
+    {
+        SendFrame(new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(envelope)));
+    }
+
+    public void SendToClient(string connectionId, ProtocolEnvelope envelope)
+    {
+        SendFrame(RelayRouting.ToClient(connectionId, ProtocolSerializer.Pack(envelope)));
+    }
+
+    private void SendFrame(RelayFrame frame)
     {
         var stream = _stream;
         if (stream == null)
@@ -63,7 +73,7 @@ public sealed class TcpRelayTransport : IDisposable
 
         lock (_sendLock)
         {
-            RelayFrame.Write(stream, new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(envelope)));
+            RelayFrame.Write(stream, frame);
         }
     }
 
@@ -90,7 +100,13 @@ public sealed class TcpRelayTransport : IDisposable
                 switch (frame.Type)
                 {
                     case RelayFrameType.Protocol:
-                        _incoming.Enqueue(ProtocolSerializer.Unpack(frame.Payload));
+                        _incoming.Enqueue(new IncomingProtocol(string.Empty, ProtocolSerializer.Unpack(frame.Payload)));
+                        break;
+                    case RelayFrameType.RoutedProtocol:
+                        var route = RelayRoute.FromPayload(frame.Payload);
+                        _incoming.Enqueue(new IncomingProtocol(
+                            route.ConnectionId,
+                            ProtocolSerializer.Unpack(route.ProtocolPayload)));
                         break;
                     case RelayFrameType.Status:
                         StatusReceived?.Invoke(Encoding.UTF8.GetString(frame.Payload));
@@ -113,5 +129,17 @@ public sealed class TcpRelayTransport : IDisposable
         {
             _running = false;
         }
+    }
+
+    private sealed class IncomingProtocol
+    {
+        public IncomingProtocol(string connectionId, ProtocolEnvelope envelope)
+        {
+            ConnectionId = connectionId;
+            Envelope = envelope;
+        }
+
+        public string ConnectionId { get; }
+        public ProtocolEnvelope Envelope { get; }
     }
 }

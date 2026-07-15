@@ -19,11 +19,18 @@ public static class TestRunner
             ("handshake payload carries runtime compatibility", HandshakePayloadCarriesRuntimeCompatibility),
             ("handshake rejects incompatible runtime metadata", HandshakeRejectsIncompatibleRuntimeMetadata),
             ("handshake save hash controls resync", HandshakeSaveHashControlsResync),
-            ("state hash report round-trips", StateHashReportRoundTrips),
+            ("snapshot hash gate requires handshake and exact snapshot", SnapshotHashGateRequiresHandshakeAndExactSnapshot),
+            ("snapshot hash retry is targeted and bounded", SnapshotHashRetryIsTargetedAndBounded),
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
+            ("direct live sync accepts and applies commands once", DirectLiveSyncAcceptsAndAppliesOnce),
+            ("relay live sync routes accepted commands once", RelayLiveSyncRoutesAcceptedCommandsOnce),
+            ("live sync state hashes detect divergence", LiveSyncStateHashesDetectDivergence),
+            ("build placement payload validates and round-trips", BuildPlacementPayloadRoundTrips),
+            ("build placement reflection codec preserves game fields", BuildPlacementReflectionCodecRoundTrips),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
+            ("relay routing isolates targeted clients", RelayRoutingIsolatesTargetedClients),
             ("join code contains relay room and secret", JoinCodeRoundTrips)
         };
 
@@ -77,7 +84,6 @@ public static class TestRunner
     private static void HandshakeRejectsIncompatibleRuntimeMetadata()
     {
         var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
-
         var wrongProtocol = CompatibleRequest(hostHash);
         wrongProtocol.ProtocolVersion++;
         AssertRejected(wrongProtocol, hostHash, "protocol version");
@@ -99,33 +105,51 @@ public static class TestRunner
     {
         var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
         var clientHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("client-save"));
-
         var mismatch = Validate(CompatibleRequest(clientHash), hostHash);
-        Assert(mismatch.Accepted, "a compatible client with a different save should be accepted for resync");
-        Assert(mismatch.SnapshotRequired, "different save hash should require a snapshot");
-        Assert(mismatch.HostSaveHash == hostHash, "host hash should be returned to the client");
-        Assert(mismatch.Reason.Contains("resync", StringComparison.OrdinalIgnoreCase), "resync reason should be explicit");
+        Assert(mismatch.Accepted && mismatch.SnapshotRequired, "different save hash should require resync");
+        Assert(mismatch.HostSaveHash == hostHash, "host hash should be returned");
 
         var matching = Validate(CompatibleRequest(hostHash), hostHash);
-        Assert(matching.Accepted, "matching client should be accepted");
-        Assert(!matching.SnapshotRequired, "matching save hash should skip snapshot transfer");
-
-        var responseAgain = HandshakeResponse.FromPayload(mismatch.ToPayload());
-        Assert(responseAgain.SnapshotRequired, "snapshot requirement should round-trip");
-        Assert(responseAgain.HostSaveHash == hostHash, "response host hash should round-trip");
+        Assert(matching.Accepted && !matching.SnapshotRequired, "matching save hash should skip transfer");
     }
 
-    private static void StateHashReportRoundTrips()
+    private static void SnapshotHashGateRequiresHandshakeAndExactSnapshot()
     {
-        var original = new StateHashReport
-        {
-            SnapshotId = "snapshot-1",
-            SaveHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("save"))
-        };
-        var restored = StateHashReport.FromPayload(original.ToPayload());
+        var tracker = new SnapshotHashTracker();
+        var hash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var report = new StateHashReport { SnapshotId = "snapshot-1", SaveHash = hash };
 
-        Assert(restored.SnapshotId == original.SnapshotId, "snapshot ID mismatch");
-        Assert(restored.SaveHash == original.SaveHash, "state hash mismatch");
+        Assert(tracker.Evaluate("peer-a", report, hash, out var reason) == SnapshotHashDecision.Rejected,
+            "pre-handshake snapshot report should be rejected");
+        Assert(reason.Contains("handshake", StringComparison.OrdinalIgnoreCase), "pre-handshake reason should be explicit");
+
+        tracker.RegisterPeer("peer-a");
+        tracker.ExpectSnapshot("peer-a", "snapshot-1");
+        var wrongSnapshot = new StateHashReport { SnapshotId = "snapshot-2", SaveHash = hash };
+        Assert(tracker.Evaluate("peer-a", wrongSnapshot, hash, out _) == SnapshotHashDecision.Rejected,
+            "wrong snapshot ID should be rejected");
+        Assert(tracker.Evaluate("peer-a", report, hash, out _) == SnapshotHashDecision.Verified,
+            "exact pending snapshot should verify");
+    }
+
+    private static void SnapshotHashRetryIsTargetedAndBounded()
+    {
+        var tracker = new SnapshotHashTracker();
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var clientHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("corrupt-save"));
+        var report = new StateHashReport { SnapshotId = "snapshot-1", SaveHash = clientHash };
+
+        tracker.RegisterPeer("peer-a");
+        tracker.RegisterPeer("peer-b");
+        tracker.ExpectSnapshot("peer-a", "snapshot-1");
+        Assert(tracker.Evaluate("peer-b", report, hostHash, out _) == SnapshotHashDecision.Rejected,
+            "a peer without the pending transfer must not trigger another peer's retry");
+        Assert(tracker.Evaluate("peer-a", report, hostHash, out _) == SnapshotHashDecision.Resend,
+            "first mismatch should allow one targeted retry");
+        Assert(tracker.Evaluate("peer-a", report, hostHash, out _) == SnapshotHashDecision.RetryExhausted,
+            "second mismatch must not amplify snapshot transfers");
+        Assert(tracker.Evaluate("peer-a", report, hostHash, out _) == SnapshotHashDecision.Rejected,
+            "exhausted transfer must remain closed");
     }
 
     private static void DuplicateSequenceFilterRejectsDuplicates()
@@ -133,6 +157,159 @@ public static class TestRunner
         var filter = new DuplicateSequenceFilter();
         Assert(filter.Accept(10), "first sequence should be accepted");
         Assert(!filter.Accept(10), "duplicate sequence should be rejected");
+        Assert(!filter.Accept(9), "out-of-order sequence should be rejected");
+        Assert(filter.Accept(11), "newer sequence should be accepted");
+    }
+
+    private static void DirectLiveSyncAcceptsAndAppliesOnce()
+    {
+        var host = new LiveSyncHost();
+        var client = new LiveSyncClient();
+        host.RegisterPlayer("direct:2", 2);
+
+        var intent = IntentEnvelope(sequence: 10, playerId: 2, tick: 42, commandType: "PlaceRoad");
+        Assert(host.TryAcceptIntent("direct:2", intent, out var accepted, out var rejection), rejection);
+        Assert(accepted != null, "host should produce an accepted command");
+        Assert(accepted!.CommandId == 1, "host should assign the first authoritative command ID");
+
+        var broadcast = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, 100, accepted.ToPayload());
+        var applied = 0;
+        if (client.TryAcceptCommand(broadcast, out var received, out rejection))
+        {
+            applied++;
+            Assert(received!.CommandType == "PlaceRoad", "client received wrong command");
+        }
+
+        if (client.TryAcceptCommand(broadcast, out _, out _))
+        {
+            applied++;
+        }
+
+        Assert(applied == 1, "accepted command should be applied exactly once");
+        Assert(!host.TryAcceptIntent("direct:2", intent, out _, out rejection), "duplicate intent should be rejected");
+        Assert(rejection.Contains("duplicate or out of order", StringComparison.Ordinal), "duplicate rejection should be explicit");
+
+        var older = IntentEnvelope(sequence: 9, playerId: 2, tick: 43, commandType: "PlaceRoad");
+        Assert(!host.TryAcceptIntent("direct:2", older, out _, out _), "out-of-order intent should be rejected");
+    }
+
+    private static void RelayLiveSyncRoutesAcceptedCommandsOnce()
+    {
+        const string connectionId = "relay-client-7";
+        var host = new LiveSyncHost();
+        var client = new LiveSyncClient();
+        host.RegisterPlayer(connectionId, 7);
+
+        var intent = IntentEnvelope(sequence: 20, playerId: 7, tick: 90, commandType: "SetWorkArea");
+        var clientFrame = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(intent));
+        var routedToHost = RelayRouting.FromClient(connectionId, clientFrame);
+        var hostRoute = RelayRoute.FromPayload(routedToHost.Payload);
+        var hostEnvelope = ProtocolSerializer.Unpack(hostRoute.ProtocolPayload);
+
+        Assert(hostRoute.ConnectionId == connectionId, "relay sender identity was not preserved");
+        Assert(host.TryAcceptIntent(hostRoute.ConnectionId, hostEnvelope, out var accepted, out var rejection), rejection);
+
+        var broadcast = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, 200, accepted!.ToPayload());
+        var broadcastFrame = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(broadcast));
+        var recipients = RelayRouting.SelectHostRecipients(broadcastFrame, new[] { connectionId, "relay-client-8" });
+        var deliveredFrame = RelayRouting.ForClient(broadcastFrame);
+        var delivered = ProtocolSerializer.Unpack(deliveredFrame.Payload);
+
+        Assert(recipients.Count == 2, "accepted relay command should broadcast to every room client");
+        Assert(client.TryAcceptCommand(delivered, out var received, out rejection), rejection);
+        Assert(received!.CommandType == "SetWorkArea", "relay client received wrong command");
+        Assert(!client.TryAcceptCommand(delivered, out _, out _), "relay duplicate should not be applied twice");
+
+        var spoofed = IntentEnvelope(sequence: 21, playerId: 8, tick: 91, commandType: "SetWorkArea");
+        Assert(!host.TryAcceptIntent(connectionId, spoofed, out _, out rejection), "spoofed relay player ID should be rejected");
+        Assert(rejection.Contains("sender is player 7", StringComparison.Ordinal), "spoof rejection should identify assigned player");
+    }
+
+    private static void LiveSyncStateHashesDetectDivergence()
+    {
+        var host = new LiveSyncHost();
+        var client = new LiveSyncClient();
+        host.RegisterPlayer("direct:2", 2);
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-state"));
+        var clientHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("client-state"));
+        var authoritative = new SimulationStateHash { PlayerId = 1, SimulationTick = 50, Hash = hostHash };
+        var local = new SimulationStateHash { PlayerId = 2, SimulationTick = 50, Hash = clientHash };
+        host.SetAuthoritativeStateHash(authoritative);
+        client.RecordLocalStateHash(local);
+
+        var report = new ProtocolEnvelope(ProtocolMessageType.StateHash, 30, local.ToPayload());
+        Assert(host.TryCheckStateHash(
+            "direct:2", report, out var received, out var divergent, out var expected, out var rejection), rejection);
+        Assert(received!.SimulationTick == 50, "host received wrong state hash tick");
+        Assert(divergent, "host should detect state divergence");
+        Assert(expected == hostHash, "host should return authoritative hash");
+
+        var response = new ProtocolEnvelope(ProtocolMessageType.StateHash, 300, authoritative.ToPayload());
+        Assert(client.TryCompareAuthoritativeStateHash(
+            response, out _, out divergent, out var actual, out rejection), rejection);
+        Assert(divergent, "client should detect state divergence");
+        Assert(actual == clientHash, "client should report its local hash");
+
+        client.Reset();
+        client.RecordLocalStateHash(authoritative);
+        Assert(client.TryCompareAuthoritativeStateHash(
+            response, out _, out divergent, out _, out rejection), rejection);
+        Assert(!divergent, "matching state hashes should not report divergence");
+    }
+
+    private static void BuildPlacementPayloadRoundTrips()
+    {
+        var original = Placement();
+        var restored = BuildPlacementIntent.FromJson(original.ToJson());
+
+        Assert(restored.Category == BuildPlacementIntent.BuildingPrefabCategory, "placement category mismatch");
+        Assert(restored.Key == 13, "placement building key mismatch");
+        Assert(restored.PositionX == 24.5f && restored.PositionY == -7.25f, "placement position mismatch");
+        Assert(restored.Rotation == 90f, "placement rotation mismatch");
+        Assert(restored.SizeX == 3f && restored.SizeY == 2f, "placement footprint mismatch");
+
+        restored.Category = 4;
+        var rejected = false;
+        try
+        {
+            restored.ToJson();
+        }
+        catch (InvalidDataException)
+        {
+            rejected = true;
+        }
+
+        Assert(rejected, "non-building placement category should be rejected");
+    }
+
+    private static void BuildPlacementReflectionCodecRoundTrips()
+    {
+        var codec = new ReflectionBuildPlacementCodec(
+            typeof(FakeSiteSpawn),
+            typeof(FakePrefabKey),
+            typeof(FakePrefabCategory),
+            typeof(FakeFloat2));
+        var placement = Placement();
+        var originalSpawn = new FakeSiteSpawn
+        {
+            Key = new FakePrefabKey(FakePrefabCategory.Building, placement.Key),
+            Position = new FakeFloat2(placement.PositionX, placement.PositionY),
+            Rotation = placement.Rotation,
+            size = new FakeFloat2(placement.SizeX, placement.SizeY)
+        };
+        var originalCaptured = codec.Capture(originalSpawn);
+        var spawn = codec.CreateSpawn(placement);
+        var captured = codec.Capture(spawn);
+
+        Assert(originalCaptured.ToJson() == placement.ToJson(), "reflection codec did not capture the game fields");
+        Assert(captured.ToJson() == placement.ToJson(), "reflection codec changed the placement payload");
+        var fakeSpawn = (FakeSiteSpawn)spawn;
+        Assert(fakeSpawn.Key.Category == FakePrefabCategory.Building, "reflection codec set wrong prefab category");
+        Assert(fakeSpawn.Key.Key == placement.Key, "reflection codec set wrong prefab key");
+        Assert(fakeSpawn.Position.x == placement.PositionX && fakeSpawn.Position.y == placement.PositionY,
+            "reflection codec set wrong position");
+        Assert(fakeSpawn.size.x == placement.SizeX && fakeSpawn.size.y == placement.SizeY,
+            "reflection codec set wrong footprint");
     }
 
     private static void SnapshotChunksReassembleAndValidate()
@@ -238,11 +415,128 @@ public static class TestRunner
             $"rejection reason should mention {reasonFragment}: {response.Reason}");
     }
 
+    private static ProtocolEnvelope IntentEnvelope(uint sequence, uint playerId, long tick, string commandType)
+    {
+        var intent = new CommandEnvelope
+        {
+            CommandId = 0,
+            PlayerId = playerId,
+            SimulationTick = tick,
+            CommandType = commandType,
+            JsonPayload = "{\"synthetic\":true}"
+        };
+        return new ProtocolEnvelope(ProtocolMessageType.PlayerIntent, sequence, intent.ToPayload());
+    }
+
+    private static BuildPlacementIntent Placement()
+    {
+        return new BuildPlacementIntent
+        {
+            Category = BuildPlacementIntent.BuildingPrefabCategory,
+            Key = 13,
+            PositionX = 24.5f,
+            PositionY = -7.25f,
+            Rotation = 90f,
+            SizeX = 3f,
+            SizeY = 2f
+        };
+    }
+
+    private static void RelayRoutingIsolatesTargetedClients()
+    {
+        var clientIds = new[] { "client-a", "client-b" };
+        var handshakeRequest = new ProtocolEnvelope(
+            ProtocolMessageType.HandshakeRequest,
+            10,
+            new HandshakeRequest { PlayerName = "Client A" }.ToPayload());
+        var clientFrame = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(handshakeRequest));
+        var hostFrame = RelayRouting.FromClient("client-a", clientFrame);
+        var sourceRoute = RelayRoute.FromPayload(hostFrame.Payload);
+
+        Assert(hostFrame.Type == RelayFrameType.RoutedProtocol, "client frame was not routed to host");
+        Assert(sourceRoute.ConnectionId == "client-a", "client source ID was not exposed to host");
+        Assert(
+            ProtocolSerializer.Unpack(sourceRoute.ProtocolPayload).Type == ProtocolMessageType.HandshakeRequest,
+            "routed handshake payload changed");
+
+        var accepted = new ProtocolEnvelope(
+            ProtocolMessageType.HandshakeAccepted,
+            11,
+            new HandshakeResponse { Accepted = true, AssignedPlayerId = 2 }.ToPayload());
+        var targetedResponse = RelayRouting.ToClient("client-a", ProtocolSerializer.Pack(accepted));
+        var responseRecipients = RelayRouting.SelectHostRecipients(targetedResponse, clientIds);
+        Assert(responseRecipients.SequenceEqual(new[] { "client-a" }), "handshake response leaked to another client");
+
+        var snapshot = new ProtocolEnvelope(
+            ProtocolMessageType.SnapshotChunk,
+            12,
+            Encoding.UTF8.GetBytes("client-a-snapshot"));
+        var targetedSnapshot = RelayRouting.ToClient("client-a", ProtocolSerializer.Pack(snapshot));
+        var snapshotRecipients = RelayRouting.SelectHostRecipients(targetedSnapshot, clientIds);
+        Assert(snapshotRecipients.SequenceEqual(new[] { "client-a" }), "snapshot frame leaked to another client");
+        var deliveredSnapshot = ProtocolSerializer.Unpack(RelayRouting.ForClient(targetedSnapshot).Payload);
+        Assert(deliveredSnapshot.Type == ProtocolMessageType.SnapshotChunk, "targeted frame was not unwrapped for client");
+
+        var clientBResponse = RelayRouting.ToClient("client-b", ProtocolSerializer.Pack(accepted));
+        Assert(
+            RelayRouting.SelectHostRecipients(clientBResponse, clientIds).SequenceEqual(new[] { "client-b" }),
+            "second client response was not independently routed");
+
+        var gameplay = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, 13, Array.Empty<byte>());
+        var broadcast = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(gameplay));
+        Assert(
+            RelayRouting.SelectHostRecipients(broadcast, clientIds).SequenceEqual(clientIds),
+            "broadcast gameplay did not reach every client");
+
+        var staleTarget = RelayRouting.ToClient("client-c", ProtocolSerializer.Pack(accepted));
+        Assert(
+            RelayRouting.SelectHostRecipients(staleTarget, clientIds).Count == 0,
+            "unknown connection ID escaped the room routing table");
+    }
+
     private static void Assert(bool condition, string message)
     {
         if (!condition)
         {
             throw new InvalidOperationException(message);
         }
+    }
+
+    private enum FakePrefabCategory
+    {
+        None = 0,
+        Building = 3
+    }
+
+    private struct FakePrefabKey
+    {
+        public FakePrefabKey(FakePrefabCategory category, int key)
+        {
+            Category = category;
+            Key = key;
+        }
+
+        public FakePrefabCategory Category;
+        public int Key;
+    }
+
+    private struct FakeFloat2
+    {
+        public FakeFloat2(float x, float y)
+        {
+            this.x = x;
+            this.y = y;
+        }
+
+        public float x;
+        public float y;
+    }
+
+    private struct FakeSiteSpawn
+    {
+        public FakePrefabKey Key;
+        public FakeFloat2 Position;
+        public float Rotation;
+        public FakeFloat2 size;
     }
 }
