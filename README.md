@@ -15,6 +15,7 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Writes client snapshots only into `OutlandersMultiplayerTemp`.
 - Does not overwrite normal Outlanders save slots.
 - Live build orders, villagers, resources, decrees, and time sync are not complete yet.
+- Direct and relay sessions carry validated player intents, host-assigned commands, and per-tick state hashes; exact Outlanders gameplay hooks still need to call these protocol APIs.
 
 ## Fast Install
 
@@ -202,7 +203,7 @@ artifacts\OutlandersMultiplayer\RelayServer\
 
 - Finish IL2CPP instrumentation for the exact Outlanders gameplay methods.
 - Patch build, demolish, cancel, priority, work-slot, decree, and time-speed actions.
-- Convert client actions into network intents.
-- Apply host-approved commands through the same game methods local play uses.
-- Add deterministic state hashes for resources, buildings, day/time, construction progress, and villagers.
+- Connect captured client actions to `MultiplayerController.SendPlayerIntent`.
+- Apply `AcceptedCommandReceived` through the same game methods local play uses.
+- Publish deterministic hashes for resources, buildings, day/time, construction progress, and villagers through `PublishStateHash`.
 - Add corrective resync when clients diverge from the host.
