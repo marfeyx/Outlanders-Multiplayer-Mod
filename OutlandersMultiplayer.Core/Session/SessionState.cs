@@ -11,6 +11,7 @@ public sealed class SessionState
     public SessionStatus Status { get; private set; } = SessionStatus.Offline;
     public string LastError { get; private set; } = string.Empty;
     public string StatusText { get; private set; } = "Offline";
+    public string RequiredAction { get; private set; } = string.Empty;
     public int PingMilliseconds { get; private set; }
 
     public IReadOnlyList<string> Players
@@ -44,7 +45,21 @@ public sealed class SessionState
             Status = SessionStatus.Error;
             LastError = error ?? string.Empty;
             StatusText = "Error";
+            RequiredAction = string.Empty;
         }
+    }
+
+    public void SetRequiredAction(string action)
+    {
+        lock (_sync)
+        {
+            RequiredAction = action ?? string.Empty;
+        }
+    }
+
+    public void ClearRequiredAction()
+    {
+        SetRequiredAction(string.Empty);
     }
 
     public void SetPing(int milliseconds)
