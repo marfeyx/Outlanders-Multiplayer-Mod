@@ -20,7 +20,7 @@ public sealed class OutlandersMultiplayerMelon : MelonMod
         _state = new SessionState();
         _controller = new MultiplayerController(_state, Log);
         _overlay = new MultiplayerOverlay(_controller);
-        _hooks = new GameHookBridge(Log);
+        _hooks = new GameHookBridge(_controller, Log);
         _hooks.InstallInstrumentation();
         Log("Outlanders Multiplayer initialized.");
     }
@@ -38,6 +38,7 @@ public sealed class OutlandersMultiplayerMelon : MelonMod
 
     public override void OnApplicationQuit()
     {
+        _hooks?.Dispose();
         _controller?.Dispose();
     }
 

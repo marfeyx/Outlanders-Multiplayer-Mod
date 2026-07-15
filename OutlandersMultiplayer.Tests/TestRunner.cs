@@ -21,6 +21,8 @@ public static class TestRunner
             ("direct live sync accepts and applies commands once", DirectLiveSyncAcceptsAndAppliesOnce),
             ("relay live sync routes accepted commands once", RelayLiveSyncRoutesAcceptedCommandsOnce),
             ("live sync state hashes detect divergence", LiveSyncStateHashesDetectDivergence),
+            ("build placement payload validates and round-trips", BuildPlacementPayloadRoundTrips),
+            ("build placement reflection codec preserves game fields", BuildPlacementReflectionCodecRoundTrips),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
@@ -175,6 +177,61 @@ public static class TestRunner
         Assert(!divergent, "matching state hashes should not report divergence");
     }
 
+    private static void BuildPlacementPayloadRoundTrips()
+    {
+        var original = Placement();
+        var restored = BuildPlacementIntent.FromJson(original.ToJson());
+
+        Assert(restored.Category == BuildPlacementIntent.BuildingPrefabCategory, "placement category mismatch");
+        Assert(restored.Key == 13, "placement building key mismatch");
+        Assert(restored.PositionX == 24.5f && restored.PositionY == -7.25f, "placement position mismatch");
+        Assert(restored.Rotation == 90f, "placement rotation mismatch");
+        Assert(restored.SizeX == 3f && restored.SizeY == 2f, "placement footprint mismatch");
+
+        restored.Category = 4;
+        var rejected = false;
+        try
+        {
+            restored.ToJson();
+        }
+        catch (InvalidDataException)
+        {
+            rejected = true;
+        }
+
+        Assert(rejected, "non-building placement category should be rejected");
+    }
+
+    private static void BuildPlacementReflectionCodecRoundTrips()
+    {
+        var codec = new ReflectionBuildPlacementCodec(
+            typeof(FakeSiteSpawn),
+            typeof(FakePrefabKey),
+            typeof(FakePrefabCategory),
+            typeof(FakeFloat2));
+        var placement = Placement();
+        var originalSpawn = new FakeSiteSpawn
+        {
+            Key = new FakePrefabKey(FakePrefabCategory.Building, placement.Key),
+            Position = new FakeFloat2(placement.PositionX, placement.PositionY),
+            Rotation = placement.Rotation,
+            size = new FakeFloat2(placement.SizeX, placement.SizeY)
+        };
+        var originalCaptured = codec.Capture(originalSpawn);
+        var spawn = codec.CreateSpawn(placement);
+        var captured = codec.Capture(spawn);
+
+        Assert(originalCaptured.ToJson() == placement.ToJson(), "reflection codec did not capture the game fields");
+        Assert(captured.ToJson() == placement.ToJson(), "reflection codec changed the placement payload");
+        var fakeSpawn = (FakeSiteSpawn)spawn;
+        Assert(fakeSpawn.Key.Category == FakePrefabCategory.Building, "reflection codec set wrong prefab category");
+        Assert(fakeSpawn.Key.Key == placement.Key, "reflection codec set wrong prefab key");
+        Assert(fakeSpawn.Position.x == placement.PositionX && fakeSpawn.Position.y == placement.PositionY,
+            "reflection codec set wrong position");
+        Assert(fakeSpawn.size.x == placement.SizeX && fakeSpawn.size.y == placement.SizeY,
+            "reflection codec set wrong footprint");
+    }
+
     private static void SnapshotChunksReassembleAndValidate()
     {
         var bytes = Enumerable.Range(0, 200_000).Select(i => (byte)(i % 251)).ToArray();
@@ -254,6 +311,20 @@ public static class TestRunner
         return new ProtocolEnvelope(ProtocolMessageType.PlayerIntent, sequence, intent.ToPayload());
     }
 
+    private static BuildPlacementIntent Placement()
+    {
+        return new BuildPlacementIntent
+        {
+            Category = BuildPlacementIntent.BuildingPrefabCategory,
+            Key = 13,
+            PositionX = 24.5f,
+            PositionY = -7.25f,
+            Rotation = 90f,
+            SizeX = 3f,
+            SizeY = 2f
+        };
+    }
+
     private static void RelayRoutingIsolatesTargetedClients()
     {
         var clientIds = new[] { "client-a", "client-b" };
@@ -312,5 +383,43 @@ public static class TestRunner
         {
             throw new InvalidOperationException(message);
         }
+    }
+
+    private enum FakePrefabCategory
+    {
+        None = 0,
+        Building = 3
+    }
+
+    private struct FakePrefabKey
+    {
+        public FakePrefabKey(FakePrefabCategory category, int key)
+        {
+            Category = category;
+            Key = key;
+        }
+
+        public FakePrefabCategory Category;
+        public int Key;
+    }
+
+    private struct FakeFloat2
+    {
+        public FakeFloat2(float x, float y)
+        {
+            this.x = x;
+            this.y = y;
+        }
+
+        public float x;
+        public float y;
+    }
+
+    private struct FakeSiteSpawn
+    {
+        public FakePrefabKey Key;
+        public FakeFloat2 Position;
+        public float Rotation;
+        public FakeFloat2 size;
     }
 }
