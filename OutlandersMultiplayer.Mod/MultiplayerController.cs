@@ -103,20 +103,24 @@ public sealed class MultiplayerController : IDisposable
         _hostSnapshot = SnapshotService.Create(Path.GetFileName(savePath), File.ReadAllBytes(savePath));
         _relayTransport = new TcpRelayTransport();
         _relayTransport.Connected += () => _state.SetStatus(SessionStatus.Hosting, $"Relay host room {roomCode}");
+        _relayTransport.ConnectionFailed += reason => _state.SetError(reason);
         _relayTransport.StatusReceived += status => _log($"Relay status: {status}");
         _relayTransport.Rejected += reason => _state.SetError(reason);
-        _relayTransport.Disconnected += reason => _state.SetStatus(SessionStatus.Offline, $"Relay disconnected: {reason}");
+        _relayTransport.Disconnected += reason => _state.SetError($"Relay disconnected: {reason}");
         _relayTransport.MessageReceived += HandleHostRelayMessage;
-        _relayTransport.Connect(relayHost, relayPort, new RelayJoinRequest
+        if (!TryStartRelayConnection(_relayTransport, relayHost, relayPort, new RelayJoinRequest
         {
             Role = RelayRole.Host,
             RoomCode = roomCode,
             SessionKey = _sessionKey,
             PlayerName = "Host"
-        });
+        }))
+        {
+            return;
+        }
 
         _state.SetPlayers(new[] { "Host" });
-        _state.SetStatus(SessionStatus.Hosting, $"Relay host {roomCode} via {relayHost}:{relayPort}");
+        _state.SetStatus(SessionStatus.Joining, $"Connecting to relay {relayHost}:{relayPort}...");
         _log($"Hosting Outlanders multiplayer via relay from {savePath}");
     }
 
@@ -133,19 +137,23 @@ public sealed class MultiplayerController : IDisposable
             _state.SetStatus(SessionStatus.Connected, $"Connected to relay room {roomCode}");
             SendHandshake(playerName);
         };
+        _relayTransport.ConnectionFailed += reason => _state.SetError(reason);
         _relayTransport.StatusReceived += status => _log($"Relay status: {status}");
         _relayTransport.Rejected += reason => _state.SetError(reason);
-        _relayTransport.Disconnected += reason => _state.SetStatus(SessionStatus.Offline, $"Relay disconnected: {reason}");
+        _relayTransport.Disconnected += reason => _state.SetError($"Relay disconnected: {reason}");
         _relayTransport.MessageReceived += HandleClientRelayMessage;
-        _relayTransport.Connect(relayHost, relayPort, new RelayJoinRequest
+        if (!TryStartRelayConnection(_relayTransport, relayHost, relayPort, new RelayJoinRequest
         {
             Role = RelayRole.Client,
             RoomCode = roomCode,
             SessionKey = _sessionKey,
             PlayerName = string.IsNullOrWhiteSpace(playerName) ? Environment.UserName : playerName
-        });
+        }))
+        {
+            return;
+        }
 
-        _state.SetStatus(SessionStatus.Joining, $"Joining relay room {roomCode}");
+        _state.SetStatus(SessionStatus.Joining, $"Connecting to relay {relayHost}:{relayPort}...");
     }
 
     public void Poll()
@@ -180,6 +188,32 @@ public sealed class MultiplayerController : IDisposable
     public void Dispose()
     {
         Disconnect();
+    }
+
+    private bool TryStartRelayConnection(
+        TcpRelayTransport transport,
+        string relayHost,
+        int relayPort,
+        RelayJoinRequest joinRequest)
+    {
+        try
+        {
+            transport.Connect(relayHost, relayPort, joinRequest);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            transport.Dispose();
+            if (ReferenceEquals(_relayTransport, transport))
+            {
+                _relayTransport = null;
+            }
+
+            var message = $"Relay connection could not start: {ex.Message}";
+            _state.SetError(message);
+            _log(message);
+            return false;
+        }
     }
 
     private void SendHandshake(string playerName)

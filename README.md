@@ -167,6 +167,7 @@ Friend cannot join with the code:
 - Make sure TCP `17668` is open on the relay server firewall.
 - Make sure both players use the same mod build.
 - Create a new code and try again.
+- Unreachable relay attempts remain non-blocking and show an overlay error after the 10-second connection timeout.
 
 MelonLoader shows remote API or 502/526 warnings:
 

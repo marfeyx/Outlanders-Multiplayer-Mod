@@ -1,9 +1,15 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using OutlandersMultiplayer.Core.Protocol;
 using OutlandersMultiplayer.Core.Relay;
+using OutlandersMultiplayer.Core.Session;
 using OutlandersMultiplayer.Core.Snapshots;
 using OutlandersMultiplayer.Core.State;
 
@@ -21,6 +27,8 @@ public static class TestRunner
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
+            ("relay connection times out without blocking", RelayConnectionTimesOutWithoutBlocking),
+            ("relay connection sends join frame asynchronously", RelayConnectionSendsJoinFrameAsynchronously),
             ("join code contains relay room and secret", JoinCodeRoundTrips)
         };
 
@@ -126,6 +134,100 @@ public static class TestRunner
 
         Assert(frame.Type == RelayFrameType.Protocol, "relay frame type mismatch");
         Assert(restored.Sequence == 7, "relay protocol sequence mismatch");
+    }
+
+    private static void RelayConnectionTimesOutWithoutBlocking()
+    {
+        var neverCompletes = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var transport = new TcpRelayTransport(
+            TimeSpan.FromMilliseconds(75),
+            (_, _, _) => neverCompletes.Task);
+        var state = new SessionState();
+        var callbackThread = -1;
+        string? failure = null;
+        transport.ConnectionFailed += message =>
+        {
+            callbackThread = Thread.CurrentThread.ManagedThreadId;
+            failure = message;
+            state.SetError(message);
+        };
+
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            failure = null;
+            state.SetStatus(SessionStatus.Joining, "Connecting to relay...");
+            var stopwatch = Stopwatch.StartNew();
+            transport.Connect("unreachable.test", 17668, CreateRelayJoinRequest());
+            stopwatch.Stop();
+
+            Assert(stopwatch.Elapsed < TimeSpan.FromMilliseconds(500), "relay Connect should return immediately");
+            Assert(transport.IsConnecting, "relay transport should report connection progress");
+            if (attempt == 0)
+            {
+                Thread.Sleep(150);
+                Assert(failure == null, "relay failure callbacks should wait for Poll");
+                Assert(state.Status == SessionStatus.Joining, "session should show connection progress until Poll handles failure");
+            }
+
+            WaitUntil(() => failure != null, TimeSpan.FromSeconds(2), transport.Poll, "relay timeout callback was not delivered");
+            Assert(failure!.Contains("timed out", StringComparison.OrdinalIgnoreCase), "relay timeout should be actionable");
+            Assert(state.Status == SessionStatus.Error, "relay timeout should become a recoverable session error");
+            Assert(callbackThread == Thread.CurrentThread.ManagedThreadId, "relay failure callback should run from Poll");
+            WaitUntil(() => transport.ActiveWorkerCount == 0, TimeSpan.FromSeconds(2), () => { }, "relay timeout worker did not terminate");
+            Assert(!transport.IsConnecting && !transport.IsRunning, "failed relay attempt should release its connection state");
+        }
+    }
+
+    private static void RelayConnectionSendsJoinFrameAsynchronously()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var acceptTask = listener.AcceptTcpClientAsync();
+        using var transport = new TcpRelayTransport(TimeSpan.FromSeconds(2));
+        var connected = false;
+        string? failure = null;
+        transport.Connected += () => connected = true;
+        transport.ConnectionFailed += message => failure = message;
+
+        transport.Connect("127.0.0.1", port, CreateRelayJoinRequest());
+        WaitUntil(() => connected || failure != null, TimeSpan.FromSeconds(2), transport.Poll, "relay connection callback was not delivered");
+        Assert(connected, $"loopback relay should connect successfully: {failure}");
+
+        using var serverClient = acceptTask.GetAwaiter().GetResult();
+        var joinFrame = RelayFrame.Read(serverClient.GetStream());
+        var joinRequest = RelayJoinRequest.FromPayload(joinFrame.Payload);
+        Assert(joinFrame.Type == RelayFrameType.Join, "relay connection should send a join frame first");
+        Assert(joinRequest.Role == RelayRole.Client, "relay join role mismatch");
+        Assert(joinRequest.RoomCode == "ROOM123", "relay join room mismatch");
+
+        transport.Stop();
+        WaitUntil(() => transport.ActiveWorkerCount == 0, TimeSpan.FromSeconds(2), () => { }, "stopped relay worker did not terminate");
+        Assert(!transport.IsConnecting && !transport.IsRunning, "stopped relay should release its socket state");
+    }
+
+    private static RelayJoinRequest CreateRelayJoinRequest()
+    {
+        return new RelayJoinRequest
+        {
+            Role = RelayRole.Client,
+            RoomCode = "ROOM123",
+            SessionKey = "secret",
+            PlayerName = "Test Player"
+        };
+    }
+
+    private static void WaitUntil(Func<bool> condition, TimeSpan timeout, Action tick, string failureMessage)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (!condition() && stopwatch.Elapsed < timeout)
+        {
+            tick();
+            Thread.Sleep(5);
+        }
+
+        tick();
+        Assert(condition(), failureMessage);
     }
 
     private static void JoinCodeRoundTrips()
