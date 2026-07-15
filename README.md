@@ -11,7 +11,7 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Adds an in-game `Outlanders Multiplayer` menu.
 - Supports `Host Online` and `Join Code` through a relay server.
 - Supports `Host Direct` and `Join Direct` for LAN, VPN, or port-forwarded direct IP play.
-- Sends the host's latest `Endless_*.dat` save as a compressed snapshot.
+- Sends the host's explicitly selected `Endless_*.dat` save as a compressed snapshot.
 - Writes client snapshots only into `OutlandersMultiplayerTemp`.
 - Does not overwrite normal Outlanders save slots.
 - Live build orders, villagers, resources, decrees, and time sync are not complete yet.
@@ -39,6 +39,14 @@ Outlanders Multiplayer v0.1.0
 ```
 
 The installer copies MelonLoader into the Outlanders game folder if it is missing, then copies the mod files into the game's `Mods` folder.
+
+On the first run, the build automatically downloads the official [MelonLoader v0.7.3 x64 archive](https://github.com/LavaGang/MelonLoader/releases/download/v0.7.3/MelonLoader.x64.zip), verifies its SHA-256 checksum, and extracts it to:
+
+```text
+tools\MelonLoader.x64.v0.7.3\
+```
+
+The fast-install path therefore requires an internet connection and the .NET 8 SDK on the first run. To bootstrap the dependency separately, run `powershell -ExecutionPolicy Bypass -File .\scripts\Bootstrap-MelonLoader.ps1`.
 
 ## Manual Install
 
@@ -140,6 +148,8 @@ Friend:
 
 Normal Outlanders saves are not overwritten by client snapshot joining.
 
+The multiplayer overlay shows the exact `user-*\Endless_*.dat` save selected for hosting. Only top-level saves in `user-*` folders are eligible; backup subfolders and `OutlandersMultiplayerTemp` are never hosting candidates. If more than one normal save exists, use the previous/next controls to choose one before starting direct or relay hosting. Hosting refuses to start until that choice is valid.
+
 Client multiplayer snapshots are written under:
 
 ```text
@@ -183,12 +193,22 @@ $env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
 .\scripts\Build-Package.ps1
 ```
 
+`Build-Package.ps1` runs the pinned MelonLoader bootstrap automatically. No manual `tools` directory setup is required in a fresh checkout.
+
+Validate the bootstrap without downloading or modifying the real dependency folder:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\Test-Bootstrap-MelonLoader.ps1
+```
+
 Run protocol tests:
 
 ```powershell
 $env:DOTNET_CLI_HOME=(Join-Path (Get-Location) '.dotnet-home')
-dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj
+dotnet run --project .\OutlandersMultiplayer.Tests\OutlandersMultiplayer.Tests.csproj --configuration Release
 ```
+
+The same command runs automatically in GitHub Actions for every pull request and push to `main`. The command exits with a nonzero status if any protocol, snapshot, relay-frame, or join-code test fails.
 
 Build output:
 

@@ -26,10 +26,14 @@ public static class TestRunner
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
+            ("hosting save selection excludes unsafe paths", HostingSaveSelectionExcludesUnsafePaths),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
             ("relay connection times out without blocking", RelayConnectionTimesOutWithoutBlocking),
             ("relay connection sends join frame asynchronously", RelayConnectionSendsJoinFrameAsynchronously),
-            ("join code contains relay room and secret", JoinCodeRoundTrips)
+            ("relay frames tolerate fragmented reads", RelayFramesTolerateFragmentedReads),
+            ("relay frames reject truncated bodies", RelayFramesRejectTruncatedBodies),
+            ("join code contains relay room and secret", JoinCodeRoundTrips),
+            ("join code escapes delimiters and backslashes", JoinCodeSpecialCharactersRoundTrip)
         };
 
         var failed = 0;
@@ -108,6 +112,65 @@ public static class TestRunner
         }
 
         Assert(rejected, "corrupt snapshot should be rejected");
+    }
+
+    private static void HostingSaveSelectionExcludesUnsafePaths()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"OutlandersMultiplayer.SaveSelection.{Guid.NewGuid():N}");
+        try
+        {
+            var firstUser = Directory.CreateDirectory(Path.Combine(root, "user-first")).FullName;
+            var secondUser = Directory.CreateDirectory(Path.Combine(root, "user-second")).FullName;
+            var activeSave = WriteSave(firstUser, "Endless_Active.dat", "active", DateTime.UtcNow.AddHours(-4));
+            var otherUserSave = WriteSave(secondUser, "Endless_Other.dat", "other", DateTime.UtcNow.AddHours(-1));
+            var staleFolder = Directory.CreateDirectory(Path.Combine(firstUser, "Backups")).FullName;
+            var staleSave = WriteSave(staleFolder, "Endless_Stale.dat", "stale", DateTime.UtcNow);
+            var tempFolder = Directory.CreateDirectory(Path.Combine(firstUser, TempSaveWriter.MultiplayerSlotFolder)).FullName;
+            var tempSave = WriteSave(tempFolder, "Endless_Temp.dat", "temp", DateTime.UtcNow.AddHours(1));
+            WriteSave(firstUser, "Endless_Active.dat.backup", "backup", DateTime.UtcNow.AddHours(2));
+
+            var activeSelection = HostingSaveSelector.Discover(root, activeSave);
+            Assert(activeSelection.SelectedPath == activeSave, "active normal save should be preferred across users");
+            Assert(activeSelection.Candidates.Count == 2, "only top-level normal saves should be eligible");
+            Assert(activeSelection.Candidates.Contains(activeSave), "active save is missing from candidates");
+            Assert(activeSelection.Candidates.Contains(otherUserSave), "other user's normal save should remain explicitly selectable");
+            Assert(!activeSelection.Candidates.Contains(staleSave), "backup-folder save should not be eligible");
+            Assert(!activeSelection.Candidates.Contains(tempSave), "multiplayer temp save should not be eligible");
+
+            var ambiguousSelection = HostingSaveSelector.Discover(root);
+            Assert(ambiguousSelection.SelectedPath == null, "multiple saves should require explicit selection");
+            Assert(ambiguousSelection.Error.Contains("Select the exact save", StringComparison.Ordinal), "ambiguous selection should explain how to proceed");
+
+            var tempSelection = HostingSaveSelector.Discover(root, tempSave);
+            Assert(tempSelection.SelectedPath == null, "temp save must not be accepted as active");
+            Assert(tempSelection.Error.Contains("not an eligible", StringComparison.Ordinal), "invalid active save should produce a clear error");
+
+            var missingSelection = HostingSaveSelector.Discover(root, Path.Combine(firstUser, "Endless_Missing.dat"));
+            Assert(missingSelection.SelectedPath == null, "missing active save must not be accepted");
+            Assert(missingSelection.Error.Contains("not an eligible", StringComparison.Ordinal), "missing active save should produce a clear error");
+
+            var singleRoot = Directory.CreateDirectory(Path.Combine(root, "single-root")).FullName;
+            var singleUser = Directory.CreateDirectory(Path.Combine(singleRoot, "user-only")).FullName;
+            var onlySave = WriteSave(singleUser, "Endless_Only.dat", "only", DateTime.UtcNow);
+            var singleSelection = HostingSaveSelector.Discover(singleRoot);
+            Assert(singleSelection.SelectedPath == onlySave, "one normal save should be selected without extra confirmation");
+            Assert(string.IsNullOrEmpty(singleSelection.Error), "single-save selection should not report an error");
+        }
+        finally
+        {
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static string WriteSave(string folder, string fileName, string contents, DateTime lastWriteUtc)
+    {
+        var path = Path.Combine(folder, fileName);
+        File.WriteAllText(path, contents);
+        File.SetLastWriteTimeUtc(path, lastWriteUtc);
+        return Path.GetFullPath(path);
     }
 
     private static void RelayFramesRoundTrip()
@@ -230,6 +293,45 @@ public static class TestRunner
         Assert(condition(), failureMessage);
     }
 
+    private static void RelayFramesTolerateFragmentedReads()
+    {
+        var payload = Encoding.UTF8.GetBytes("fragmented relay payload");
+        var bytes = SerializeRelayFrame(new RelayFrame(RelayFrameType.Protocol, payload));
+        using var stream = new ChunkedReadStream(bytes, maxChunkSize: 2);
+
+        var restored = RelayFrame.Read(stream);
+
+        Assert(restored.Type == RelayFrameType.Protocol, "fragmented relay frame type mismatch");
+        Assert(restored.Payload.SequenceEqual(payload), "fragmented relay frame payload mismatch");
+    }
+
+    private static void RelayFramesRejectTruncatedBodies()
+    {
+        var bytes = SerializeRelayFrame(new RelayFrame(RelayFrameType.Protocol, Encoding.UTF8.GetBytes("complete payload")));
+        var declaredLength = BitConverter.ToInt32(bytes, 0);
+        BitConverter.GetBytes(declaredLength + 5).CopyTo(bytes, 0);
+
+        var rejected = false;
+        using var stream = new ChunkedReadStream(bytes, maxChunkSize: 3);
+        try
+        {
+            RelayFrame.Read(stream);
+        }
+        catch (EndOfStreamException ex)
+        {
+            rejected = ex.Message.Contains("relay frame body", StringComparison.Ordinal);
+        }
+
+        Assert(rejected, "relay frame with a truncated body should fail with a deterministic EOF error");
+    }
+
+    private static byte[] SerializeRelayFrame(RelayFrame frame)
+    {
+        using var stream = new MemoryStream();
+        RelayFrame.Write(stream, frame);
+        return stream.ToArray();
+    }
+
     private static void JoinCodeRoundTrips()
     {
         var code = JoinCode.Encode("relay.example.net", 17668, "ROOM123", "SECRET456");
@@ -241,11 +343,71 @@ public static class TestRunner
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
     }
 
+    private static void JoinCodeSpecialCharactersRoundTrip()
+    {
+        const string relayHost = @"relay|host\edge";
+        const string roomCode = @"ROOM\1|A";
+        const string sessionKey = @"SECRET|456\p";
+
+        var code = JoinCode.Encode(relayHost, 17668, roomCode, sessionKey);
+        Assert(JoinCode.TryDecode(code, out var decoded), "join code with special characters should decode");
+        Assert(decoded.RelayHost == relayHost, "escaped relay host mismatch");
+        Assert(decoded.RelayPort == 17668, "escaped join code relay port mismatch");
+        Assert(decoded.RoomCode == roomCode, "escaped room code mismatch");
+        Assert(decoded.SessionKey == sessionKey, "escaped session key mismatch");
+    }
+
     private static void Assert(bool condition, string message)
     {
         if (!condition)
         {
             throw new InvalidOperationException(message);
         }
+    }
+}
+
+internal sealed class ChunkedReadStream : Stream
+{
+    private readonly MemoryStream _inner;
+    private readonly int _maxChunkSize;
+
+    public ChunkedReadStream(byte[] bytes, int maxChunkSize)
+    {
+        _inner = new MemoryStream(bytes, writable: false);
+        _maxChunkSize = maxChunkSize;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => _inner.Length;
+
+    public override long Position
+    {
+        get => _inner.Position;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        return _inner.Read(buffer, offset, Math.Min(count, _maxChunkSize));
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _inner.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 }

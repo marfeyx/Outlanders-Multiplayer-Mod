@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using OutlandersMultiplayer.Core.Snapshots;
 using OutlandersMultiplayer.Core.State;
 
 namespace OutlandersMultiplayer.Mod.Game;
@@ -9,12 +10,7 @@ public static class OutlandersSaveLocator
 {
     public static string? FindUserFolder()
     {
-        var root = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "AppData",
-            "LocalLow",
-            "Pomelo Games",
-            "Outlanders");
+        var root = GetOutlandersRoot();
 
         if (!Directory.Exists(root))
         {
@@ -26,18 +22,25 @@ public static class OutlandersSaveLocator
             .FirstOrDefault();
     }
 
-    public static string? FindLatestSandboxSave()
+    public static HostingSaveSelection DiscoverHostingSaves(string? activeSavePath = null)
     {
-        var userFolder = FindUserFolder();
-        if (userFolder == null)
-        {
-            return null;
-        }
+        return HostingSaveSelector.Discover(GetOutlandersRoot(), activeSavePath);
+    }
 
-        return Directory.GetFiles(userFolder, "Endless_*.dat", SearchOption.AllDirectories)
-            .Where(path => !path.EndsWith(".backup", StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(File.GetLastWriteTimeUtc)
-            .FirstOrDefault();
+    public static string GetHostingSaveDisplayPath(string path)
+    {
+        var userFolder = Path.GetFileName(Path.GetDirectoryName(path) ?? string.Empty);
+        return Path.Combine(userFolder, Path.GetFileName(path));
+    }
+
+    private static string GetOutlandersRoot()
+    {
+        return Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "AppData",
+            "LocalLow",
+            "Pomelo Games",
+            "Outlanders");
     }
 
     public static string HashSaveFile(string path)
