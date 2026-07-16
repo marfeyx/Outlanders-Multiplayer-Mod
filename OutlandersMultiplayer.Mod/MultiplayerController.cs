@@ -23,29 +23,66 @@ public sealed class MultiplayerController : IDisposable
     private uint _nextSequence = 1;
     private uint _nextPlayerId = 2;
     private string _sessionKey = string.Empty;
+    private IReadOnlyList<string> _hostingSaveCandidates = Array.Empty<string>();
+    private string? _selectedHostingSavePath;
 
     public MultiplayerController(SessionState state, Action<string> log)
     {
         _state = state;
         _log = log;
+        RefreshHostingSaveSelection();
     }
 
     public SessionState State => _state;
+    public IReadOnlyList<string> HostingSaveCandidates => _hostingSaveCandidates;
+    public string? SelectedHostingSavePath => _selectedHostingSavePath;
+    public string HostingSaveDisplayPath => _selectedHostingSavePath == null
+        ? (_hostingSaveCandidates.Count > 1 ? $"Select one of {_hostingSaveCandidates.Count} saves" : "No eligible save")
+        : OutlandersSaveLocator.GetHostingSaveDisplayPath(_selectedHostingSavePath);
+
+    public void RefreshHostingSaveSelection()
+    {
+        var previousSelection = _selectedHostingSavePath;
+        var discovery = OutlandersSaveLocator.DiscoverHostingSaves();
+        _hostingSaveCandidates = discovery.Candidates;
+        _selectedHostingSavePath = FindCandidate(previousSelection) ?? discovery.SelectedPath;
+    }
+
+    public void SelectNextHostingSave()
+    {
+        SelectHostingSave(1);
+    }
+
+    public void SelectPreviousHostingSave()
+    {
+        SelectHostingSave(-1);
+    }
+
+    public bool SelectActiveHostingSave(string activeSavePath)
+    {
+        var discovery = OutlandersSaveLocator.DiscoverHostingSaves(activeSavePath);
+        _hostingSaveCandidates = discovery.Candidates;
+        _selectedHostingSavePath = discovery.SelectedPath;
+        if (_selectedHostingSavePath == null)
+        {
+            _state.SetError(discovery.Error);
+            return false;
+        }
+
+        _log($"Selected active Outlanders save {_selectedHostingSavePath}");
+        ClearSaveSelectionError();
+        return true;
+    }
 
     public void Host(int port, string sessionKey)
     {
         Disconnect();
         _sessionKey = sessionKey ?? string.Empty;
 
-        var savePath = OutlandersSaveLocator.FindLatestSandboxSave();
-        if (savePath == null)
+        if (!TryPrepareHostSnapshot(out var savePath))
         {
-            _state.SetError("No Endless/Sandbox save file was found.");
             return;
         }
-
-        var saveBytes = File.ReadAllBytes(savePath);
-        _hostSnapshot = SnapshotService.Create(Path.GetFileName(savePath), saveBytes);
 
         _transport = new LiteNetLibDirectTransport();
         _transport.ConnectionRequested += request => request.AcceptIfKey(_sessionKey);
@@ -93,14 +130,11 @@ public sealed class MultiplayerController : IDisposable
         Disconnect();
         _sessionKey = sessionKey ?? string.Empty;
 
-        var savePath = OutlandersSaveLocator.FindLatestSandboxSave();
-        if (savePath == null)
+        if (!TryPrepareHostSnapshot(out var savePath))
         {
-            _state.SetError("No Endless/Sandbox save file was found.");
             return;
         }
 
-        _hostSnapshot = SnapshotService.Create(Path.GetFileName(savePath), File.ReadAllBytes(savePath));
         _relayTransport = new TcpRelayTransport();
         _relayTransport.Connected += () => _state.SetStatus(SessionStatus.Hosting, $"Relay host room {roomCode}");
         _relayTransport.StatusReceived += status => _log($"Relay status: {status}");
@@ -180,6 +214,98 @@ public sealed class MultiplayerController : IDisposable
     public void Dispose()
     {
         Disconnect();
+    }
+
+    private void SelectHostingSave(int direction)
+    {
+        RefreshHostingSaveSelection();
+        if (_hostingSaveCandidates.Count == 0)
+        {
+            _state.SetError("No eligible top-level Endless/Sandbox save was found.");
+            return;
+        }
+
+        var currentIndex = -1;
+        for (var index = 0; index < _hostingSaveCandidates.Count; index++)
+        {
+            if (string.Equals(_hostingSaveCandidates[index], _selectedHostingSavePath, StringComparison.OrdinalIgnoreCase))
+            {
+                currentIndex = index;
+                break;
+            }
+        }
+
+        var nextIndex = currentIndex < 0
+            ? (direction > 0 ? 0 : _hostingSaveCandidates.Count - 1)
+            : (currentIndex + direction + _hostingSaveCandidates.Count) % _hostingSaveCandidates.Count;
+        _selectedHostingSavePath = _hostingSaveCandidates[nextIndex];
+        _log($"Selected Outlanders save {_selectedHostingSavePath}");
+        ClearSaveSelectionError();
+    }
+
+    private void ClearSaveSelectionError()
+    {
+        var error = _state.LastError;
+        if (_state.Status == SessionStatus.Error
+            && (error.StartsWith("Multiple eligible saves", StringComparison.Ordinal)
+                || error.StartsWith("No eligible", StringComparison.Ordinal)
+                || error.StartsWith("Active save", StringComparison.Ordinal)))
+        {
+            _state.SetStatus(SessionStatus.Offline, $"Selected save: {HostingSaveDisplayPath}");
+        }
+    }
+
+    private string? FindCandidate(string? path)
+    {
+        if (path == null)
+        {
+            return null;
+        }
+
+        foreach (var candidate in _hostingSaveCandidates)
+        {
+            if (string.Equals(candidate, path, StringComparison.OrdinalIgnoreCase))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private bool TryPrepareHostSnapshot(out string savePath)
+    {
+        savePath = string.Empty;
+        RefreshHostingSaveSelection();
+        if (_selectedHostingSavePath == null)
+        {
+            var error = _hostingSaveCandidates.Count > 1
+                ? "Multiple eligible saves were found. Select the exact save in the multiplayer overlay before hosting."
+                : "No eligible top-level Endless/Sandbox save was found. Load or create a normal save, then refresh.";
+            _state.SetError(error);
+            return false;
+        }
+
+        var validation = OutlandersSaveLocator.DiscoverHostingSaves(_selectedHostingSavePath);
+        if (validation.SelectedPath == null)
+        {
+            _selectedHostingSavePath = null;
+            _state.SetError(validation.Error);
+            return false;
+        }
+
+        savePath = validation.SelectedPath;
+        try
+        {
+            _hostSnapshot = SnapshotService.Create(Path.GetFileName(savePath), File.ReadAllBytes(savePath));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _hostSnapshot = null;
+            _state.SetError($"Selected save could not be read: {ex.Message}");
+            return false;
+        }
     }
 
     private void SendHandshake(string playerName)

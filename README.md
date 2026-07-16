@@ -11,7 +11,7 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Adds an in-game `Outlanders Multiplayer` menu.
 - Supports `Host Online` and `Join Code` through a relay server.
 - Supports `Host Direct` and `Join Direct` for LAN, VPN, or port-forwarded direct IP play.
-- Sends the host's latest `Endless_*.dat` save as a compressed snapshot.
+- Sends the host's explicitly selected `Endless_*.dat` save as a compressed snapshot.
 - Writes client snapshots only into `OutlandersMultiplayerTemp`.
 - Does not overwrite normal Outlanders save slots.
 - Live build orders, villagers, resources, decrees, and time sync are not complete yet.
@@ -147,6 +147,8 @@ Friend:
 ## Save Safety
 
 Normal Outlanders saves are not overwritten by client snapshot joining.
+
+The multiplayer overlay shows the exact `user-*\Endless_*.dat` save selected for hosting. Only top-level saves in `user-*` folders are eligible; backup subfolders and `OutlandersMultiplayerTemp` are never hosting candidates. If more than one normal save exists, use the previous/next controls to choose one before starting direct or relay hosting. Hosting refuses to start until that choice is valid.
 
 Client multiplayer snapshots are written under:
 
