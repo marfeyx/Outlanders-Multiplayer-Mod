@@ -12,6 +12,7 @@ using OutlandersMultiplayer.Core.Relay;
 using OutlandersMultiplayer.Core.Session;
 using OutlandersMultiplayer.Core.Snapshots;
 using OutlandersMultiplayer.Core.State;
+using RelayServerHost = OutlandersMultiplayer.RelayServer.RelayServer;
 
 namespace OutlandersMultiplayer.Tests;
 
@@ -28,6 +29,7 @@ public static class TestRunner
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("hosting save selection excludes unsafe paths", HostingSaveSelectionExcludesUnsafePaths),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
+            ("relay disconnects idle clients and remains available", RelayDisconnectsIdleClientsAndRemainsAvailable),
             ("relay connection times out without blocking", RelayConnectionTimesOutWithoutBlocking),
             ("relay connection sends join frame asynchronously", RelayConnectionSendsJoinFrameAsynchronously),
             ("relay frames tolerate fragmented reads", RelayFramesTolerateFragmentedReads),
@@ -341,6 +343,98 @@ public static class TestRunner
         Assert(decoded.RelayPort == 17668, "relay port mismatch");
         Assert(decoded.RoomCode == "ROOM123", "room code mismatch");
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
+    }
+
+    private static void RelayDisconnectsIdleClientsAndRemainsAvailable()
+    {
+        RelayDisconnectsIdleClientsAndRemainsAvailableAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task RelayDisconnectsIdleClientsAndRemainsAvailableAsync()
+    {
+        using var shutdown = new CancellationTokenSource();
+        var server = new RelayServerHost(
+            port: 0,
+            handshakeTimeout: TimeSpan.FromMilliseconds(200),
+            clientReadTimeout: TimeSpan.FromMilliseconds(250));
+        var serverTask = server.RunAsync(shutdown.Token);
+
+        try
+        {
+            Assert(server.ListeningPort > 0, "relay did not bind a test port");
+
+            using (var idleClient = new TcpClient())
+            {
+                await idleClient.ConnectAsync(IPAddress.Loopback, server.ListeningPort);
+                Assert(
+                    await WaitForDisconnectAsync(idleClient, TimeSpan.FromSeconds(3)),
+                    "client that sent no Join frame remained connected");
+            }
+
+            using (var validClient = new TcpClient())
+            {
+                validClient.ReceiveTimeout = 3_000;
+                await validClient.ConnectAsync(IPAddress.Loopback, server.ListeningPort);
+                var stream = validClient.GetStream();
+                var join = new RelayJoinRequest
+                {
+                    Role = RelayRole.Host,
+                    RoomCode = "TIMEOUT1",
+                    SessionKey = "secret",
+                    PlayerName = "Timeout Test Host"
+                };
+
+                RelayFrame.Write(stream, new RelayFrame(RelayFrameType.Join, join.ToPayload()));
+                var status = RelayFrame.Read(stream);
+                Assert(status.Type == RelayFrameType.Status, "valid client was not accepted after idle timeout");
+                Assert(status.GetUtf8Payload() == "relay-connected", "valid client received unexpected relay status");
+                Assert(
+                    await WaitForDisconnectAsync(validClient, TimeSpan.FromSeconds(3)),
+                    "joined client remained connected after its read timeout");
+            }
+
+            await WaitUntilAsync(
+                () => server.ActiveConnectionCount == 0,
+                TimeSpan.FromSeconds(3),
+                "timed-out relay connections were not cleaned up");
+        }
+        finally
+        {
+            shutdown.Cancel();
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    private static async Task<bool> WaitForDisconnectAsync(TcpClient client, TimeSpan timeout)
+    {
+        using var timeoutSource = new CancellationTokenSource(timeout);
+        var buffer = new byte[1];
+        try
+        {
+            return await client.GetStream().ReadAsync(buffer, timeoutSource.Token) == 0;
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or ObjectDisposedException)
+        {
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> predicate, TimeSpan timeout, string failureMessage)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (!predicate())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new InvalidOperationException(failureMessage);
+            }
+
+            await Task.Delay(25);
+        }
     }
 
     private static void JoinCodeSpecialCharactersRoundTrip()
