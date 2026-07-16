@@ -48,6 +48,7 @@ public sealed class MultiplayerController : IDisposable
 
     public event Action<CommandEnvelope>? AcceptedCommandReceived;
     public event Action<long, string, string>? StateDivergenceDetected;
+    public event Func<CommandEnvelope, string?>? PlayerIntentValidating;
     public IReadOnlyList<string> HostingSaveCandidates => _hostingSaveCandidates;
     public string? SelectedHostingSavePath => _selectedHostingSavePath;
     public string HostingSaveDisplayPath => _selectedHostingSavePath == null
@@ -661,6 +662,27 @@ public sealed class MultiplayerController : IDisposable
             _log($"Rejected player intent from {senderId}: {rejection}");
             reject(rejection);
             return false;
+        }
+
+        foreach (var validator in PlayerIntentValidating?.GetInvocationList() ?? Array.Empty<Delegate>())
+        {
+            try
+            {
+                var validationError = ((Func<CommandEnvelope, string?>)validator)(command);
+                if (!string.IsNullOrWhiteSpace(validationError))
+                {
+                    _log($"Rejected player intent from {senderId}: {validationError}");
+                    reject(validationError);
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                var validationError = $"Gameplay validation failed: {ex.Message}";
+                _log($"Rejected player intent from {senderId}: {validationError}");
+                reject(validationError);
+                return false;
+            }
         }
 
         var accepted = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, NextSequence(), command.ToPayload());
