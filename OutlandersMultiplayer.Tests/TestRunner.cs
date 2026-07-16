@@ -3,7 +3,10 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -43,6 +46,9 @@ public static class TestRunner
             ("relay disconnects idle clients and remains available", RelayDisconnectsIdleClientsAndRemainsAvailable),
             ("relay connection times out without blocking", RelayConnectionTimesOutWithoutBlocking),
             ("relay connection sends join frame asynchronously", RelayConnectionSendsJoinFrameAsynchronously),
+            ("relay TLS encrypts and routes host client traffic", RelayTlsEncryptsAndRoutesTraffic),
+            ("relay TLS rejects an untrusted certificate", RelayTlsRejectsUntrustedCertificate),
+            ("relay plaintext requires explicit loopback mode", RelayPlaintextRequiresExplicitLoopbackMode),
             ("relay frames tolerate fragmented reads", RelayFramesTolerateFragmentedReads),
             ("relay frames reject truncated bodies", RelayFramesRejectTruncatedBodies),
             ("join code contains relay room and secret", JoinCodeRoundTrips),
@@ -540,7 +546,9 @@ public static class TestRunner
         listener.Start();
         var port = ((IPEndPoint)listener.LocalEndpoint).Port;
         var acceptTask = listener.AcceptTcpClientAsync();
-        using var transport = new TcpRelayTransport(TimeSpan.FromSeconds(2));
+        using var transport = new TcpRelayTransport(
+            TimeSpan.FromSeconds(2),
+            security: RelayTransportSecurity.InsecureLocalhost);
         var connected = false;
         string? failure = null;
         transport.Connected += () => connected = true;
@@ -560,6 +568,215 @@ public static class TestRunner
         transport.Stop();
         WaitUntil(() => transport.ActiveWorkerCount == 0, TimeSpan.FromSeconds(2), () => { }, "stopped relay worker did not terminate");
         Assert(!transport.IsConnecting && !transport.IsRunning, "stopped relay should release its socket state");
+    }
+
+    private static void RelayTlsEncryptsAndRoutesTraffic()
+    {
+        RelayTlsEncryptsAndRoutesTrafficAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task RelayTlsEncryptsAndRoutesTrafficAsync()
+    {
+        using var certificate = CreateLocalhostCertificate();
+        using var shutdown = new CancellationTokenSource();
+        var server = new RelayServerHost(
+            port: 0,
+            serverCertificate: certificate,
+            listenAddress: IPAddress.Loopback);
+        var serverTask = server.RunAsync(shutdown.Token);
+
+        bool ValidateTestCertificate(
+            object sender,
+            System.Security.Cryptography.X509Certificates.X509Certificate? presented,
+            X509Chain? chain,
+            SslPolicyErrors errors)
+        {
+            return presented != null
+                && presented.GetCertHashString().Equals(certificate.GetCertHashString(), StringComparison.OrdinalIgnoreCase)
+                && (errors & (SslPolicyErrors.RemoteCertificateNameMismatch | SslPolicyErrors.RemoteCertificateNotAvailable)) == 0;
+        }
+
+        using var host = new TcpRelayTransport(
+            TimeSpan.FromSeconds(3),
+            null,
+            RelayTransportSecurity.Tls,
+            ValidateTestCertificate);
+        using var client = new TcpRelayTransport(
+            TimeSpan.FromSeconds(3),
+            null,
+            RelayTransportSecurity.Tls,
+            ValidateTestCertificate);
+        string? hostStatus = null;
+        string? clientStatus = null;
+        string? failure = null;
+        ProtocolEnvelope? received = null;
+        host.StatusReceived += value => hostStatus = value;
+        client.StatusReceived += value => clientStatus = value;
+        host.ConnectionFailed += value => failure = value;
+        client.ConnectionFailed += value => failure = value;
+        host.MessageReceived += (_, envelope) => received = envelope;
+
+        try
+        {
+            host.Connect("localhost", server.ListeningPort, new RelayJoinRequest
+            {
+                Role = RelayRole.Host,
+                RoomCode = "TLSROOM",
+                SessionKey = "join-secret-not-visible-on-the-wire",
+                PlayerName = "TLS Host"
+            });
+            WaitUntil(
+                () => hostStatus == "relay-connected" || failure != null,
+                TimeSpan.FromSeconds(5),
+                host.Poll,
+                "TLS relay host did not join");
+            Assert(failure == null, $"TLS relay host failed: {failure}");
+
+            client.Connect("localhost", server.ListeningPort, new RelayJoinRequest
+            {
+                Role = RelayRole.Client,
+                RoomCode = "TLSROOM",
+                SessionKey = "join-secret-not-visible-on-the-wire",
+                PlayerName = "TLS Client"
+            });
+            WaitUntil(
+                () => clientStatus == "relay-connected" || failure != null,
+                TimeSpan.FromSeconds(5),
+                () => { host.Poll(); client.Poll(); },
+                "TLS relay client did not join");
+            Assert(failure == null, $"TLS relay client failed: {failure}");
+
+            var payload = Encoding.UTF8.GetBytes("authenticated encrypted gameplay payload");
+            client.Send(new ProtocolEnvelope(ProtocolMessageType.TextStatus, 901, payload));
+            WaitUntil(
+                () => received != null,
+                TimeSpan.FromSeconds(5),
+                () => { host.Poll(); client.Poll(); },
+                "TLS relay did not route client traffic to the host");
+            Assert(received!.Sequence == 901, "TLS relay changed the gameplay sequence");
+            Assert(received.Payload.SequenceEqual(payload), "TLS relay changed the gameplay payload");
+        }
+        finally
+        {
+            host.Stop();
+            client.Stop();
+            shutdown.Cancel();
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    private static void RelayTlsRejectsUntrustedCertificate()
+    {
+        RelayTlsRejectsUntrustedCertificateAsync().GetAwaiter().GetResult();
+    }
+
+    private static async Task RelayTlsRejectsUntrustedCertificateAsync()
+    {
+        using var certificate = CreateLocalhostCertificate();
+        using var shutdown = new CancellationTokenSource();
+        var server = new RelayServerHost(
+            port: 0,
+            serverCertificate: certificate,
+            listenAddress: IPAddress.Loopback);
+        var serverTask = server.RunAsync(shutdown.Token);
+        using var transport = new TcpRelayTransport(TimeSpan.FromSeconds(3));
+        string? failure = null;
+        transport.ConnectionFailed += value => failure = value;
+
+        try
+        {
+            transport.Connect("localhost", server.ListeningPort, CreateRelayJoinRequest());
+            WaitUntil(
+                () => failure != null,
+                TimeSpan.FromSeconds(5),
+                transport.Poll,
+                "untrusted relay certificate was not rejected");
+            Assert(
+                failure!.Contains("TLS certificate validation failed", StringComparison.Ordinal),
+                $"certificate rejection was not actionable: {failure}");
+        }
+        finally
+        {
+            transport.Stop();
+            shutdown.Cancel();
+            await serverTask.WaitAsync(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    private static void RelayPlaintextRequiresExplicitLoopbackMode()
+    {
+        using var transport = new TcpRelayTransport(security: RelayTransportSecurity.InsecureLocalhost);
+        var rejectedPublicHost = false;
+        try
+        {
+            transport.Connect("relay.example.com", 17668, CreateRelayJoinRequest());
+        }
+        catch (InvalidOperationException ex)
+        {
+            rejectedPublicHost = ex.Message.Contains("loopback", StringComparison.OrdinalIgnoreCase);
+        }
+
+        Assert(rejectedPublicHost, "plaintext client mode accepted a public relay host");
+
+        var rejectedPublicListener = false;
+        try
+        {
+            _ = new RelayServerHost(
+                port: 0,
+                listenAddress: IPAddress.Any,
+                allowInsecureLocalhost: true);
+        }
+        catch (InvalidOperationException ex)
+        {
+            rejectedPublicListener = ex.Message.Contains("loopback", StringComparison.OrdinalIgnoreCase);
+        }
+
+        Assert(rejectedPublicListener, "plaintext relay server accepted a public listener");
+    }
+
+    private static X509Certificate2 CreateLocalhostCertificate()
+    {
+        RSA key;
+        if (OperatingSystem.IsWindows())
+        {
+            key = new RSACryptoServiceProvider(2048, new CspParameters(24)
+            {
+                KeyNumber = (int)KeyNumber.Exchange,
+                Flags = CspProviderFlags.CreateEphemeralKey
+            });
+        }
+        else
+        {
+            key = RSA.Create(2048);
+        }
+        var request = new CertificateRequest(
+            "CN=localhost",
+            key,
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, false));
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
+            false));
+        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            new OidCollection { new("1.3.6.1.5.5.7.3.1") },
+            false));
+        var names = new SubjectAlternativeNameBuilder();
+        names.AddDnsName("localhost");
+        names.AddIpAddress(IPAddress.Loopback);
+        request.CertificateExtensions.Add(names.Build());
+        using var generated = request.CreateSelfSigned(
+            DateTimeOffset.UtcNow.AddMinutes(-5),
+            DateTimeOffset.UtcNow.AddDays(1));
+        const string password = "outlanders-test-certificate";
+        var pfx = generated.Export(X509ContentType.Pfx, password);
+        key.Dispose();
+        return new X509Certificate2(
+            pfx,
+            password,
+            OperatingSystem.IsWindows()
+                ? X509KeyStorageFlags.UserKeySet
+                : X509KeyStorageFlags.EphemeralKeySet);
     }
 
     private static RelayJoinRequest CreateRelayJoinRequest()
@@ -762,7 +979,9 @@ public static class TestRunner
         var server = new RelayServerHost(
             port: 0,
             handshakeTimeout: TimeSpan.FromMilliseconds(200),
-            clientReadTimeout: TimeSpan.FromMilliseconds(250));
+            clientReadTimeout: TimeSpan.FromMilliseconds(250),
+            listenAddress: IPAddress.Loopback,
+            allowInsecureLocalhost: true);
         var serverTask = server.RunAsync(shutdown.Token);
 
         try

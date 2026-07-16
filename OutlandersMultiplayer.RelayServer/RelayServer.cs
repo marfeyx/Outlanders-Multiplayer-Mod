@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using OutlandersMultiplayer.Core.Relay;
 
 namespace OutlandersMultiplayer.RelayServer;
@@ -13,19 +16,45 @@ public sealed class RelayServer
     private readonly int _port;
     private readonly TimeSpan _handshakeTimeout;
     private readonly TimeSpan _clientReadTimeout;
+    private readonly X509Certificate2? _serverCertificate;
+    private readonly IPAddress _listenAddress;
+    private readonly bool _allowInsecureLocalhost;
     private readonly ConcurrentDictionary<string, RelayRoom> _rooms = new(StringComparer.OrdinalIgnoreCase);
     private int _activeConnectionCount;
 
     public RelayServer(
         int port,
         TimeSpan? handshakeTimeout = null,
-        TimeSpan? clientReadTimeout = null)
+        TimeSpan? clientReadTimeout = null,
+        X509Certificate2? serverCertificate = null,
+        IPAddress? listenAddress = null,
+        bool allowInsecureLocalhost = false)
     {
         if (port is < 0 or > 65535) throw new ArgumentOutOfRangeException(nameof(port));
+
+        _listenAddress = listenAddress ?? IPAddress.Any;
+        if (allowInsecureLocalhost && !IPAddress.IsLoopback(_listenAddress))
+        {
+            throw new InvalidOperationException(
+                "Plaintext relay mode may only listen on a loopback address. Bind explicitly to 127.0.0.1 or ::1.");
+        }
+
+        if (!allowInsecureLocalhost && serverCertificate == null)
+        {
+            throw new InvalidOperationException(
+                "A TLS server certificate is required. Configure a certificate or explicitly enable loopback-only plaintext development mode.");
+        }
+
+        if (serverCertificate != null && !serverCertificate.HasPrivateKey)
+        {
+            throw new ArgumentException("The TLS server certificate must include its private key.", nameof(serverCertificate));
+        }
 
         _port = port;
         _handshakeTimeout = ValidateTimeout(handshakeTimeout ?? DefaultHandshakeTimeout, nameof(handshakeTimeout));
         _clientReadTimeout = ValidateTimeout(clientReadTimeout ?? DefaultClientReadTimeout, nameof(clientReadTimeout));
+        _serverCertificate = serverCertificate;
+        _allowInsecureLocalhost = allowInsecureLocalhost;
     }
 
     public int ListeningPort { get; private set; }
@@ -33,12 +62,13 @@ public sealed class RelayServer
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        var listener = new TcpListener(IPAddress.Any, _port);
+        var listener = new TcpListener(_listenAddress, _port);
         listener.Start();
         ListeningPort = ((IPEndPoint)listener.LocalEndpoint).Port;
         Console.WriteLine(
-            $"Outlanders relay listening on TCP {ListeningPort} " +
-            $"(handshake timeout {_handshakeTimeout.TotalSeconds:g}s, read timeout {_clientReadTimeout.TotalSeconds:g}s)");
+            $"Outlanders relay listening on {_listenAddress}:{ListeningPort} " +
+            $"({(_allowInsecureLocalhost ? "INSECURE LOOPBACK PLAINTEXT" : "TLS")}, " +
+            $"handshake timeout {_handshakeTimeout.TotalSeconds:g}s, read timeout {_clientReadTimeout.TotalSeconds:g}s)");
 
         try
         {
@@ -60,9 +90,18 @@ public sealed class RelayServer
     private async Task HandleClientAsync(TcpClient tcpClient, CancellationToken cancellationToken)
     {
         Interlocked.Increment(ref _activeConnectionCount);
-        var connection = new RelayConnection(tcpClient);
+        RelayConnection? connection = null;
         try
         {
+            Stream stream = tcpClient.GetStream();
+            if (!_allowInsecureLocalhost)
+            {
+                var tlsStream = new SslStream(stream, leaveInnerStreamOpen: false);
+                await AuthenticateClientAsync(tlsStream, cancellationToken);
+                stream = tlsStream;
+            }
+
+            connection = new RelayConnection(tcpClient, stream);
             var joinFrame = await RelayFrameReader.ReadAsync(
                 connection.Stream,
                 _handshakeTimeout,
@@ -122,13 +161,19 @@ public sealed class RelayServer
         catch (IOException)
         {
         }
+        catch (AuthenticationException ex)
+        {
+            Console.WriteLine($"Relay TLS authentication failed: {ex.GetBaseException().Message}");
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"Relay connection error: {ex.Message}");
         }
         finally
         {
-            if (!string.IsNullOrEmpty(connection.RoomCode) && _rooms.TryGetValue(connection.RoomCode, out var room))
+            if (connection != null &&
+                !string.IsNullOrEmpty(connection.RoomCode) &&
+                _rooms.TryGetValue(connection.RoomCode, out var room))
             {
                 room.Leave(connection);
                 if (room.IsEmpty)
@@ -137,8 +182,34 @@ public sealed class RelayServer
                 }
             }
 
-            connection.Dispose();
+            connection?.Dispose();
+            if (connection == null)
+            {
+                try { tcpClient.Close(); } catch { }
+            }
             Interlocked.Decrement(ref _activeConnectionCount);
+        }
+    }
+
+    private async Task AuthenticateClientAsync(SslStream tlsStream, CancellationToken cancellationToken)
+    {
+        using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutSource.CancelAfter(_handshakeTimeout);
+
+        try
+        {
+            await tlsStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions
+            {
+                ServerCertificate = _serverCertificate,
+                ClientCertificateRequired = false,
+                EnabledSslProtocols = SslProtocols.Tls12,
+                CertificateRevocationCheckMode = X509RevocationMode.NoCheck
+            }, timeoutSource.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException(
+                $"Timed out waiting for TLS authentication after {_handshakeTimeout.TotalSeconds:g} seconds.");
         }
     }
 
@@ -335,14 +406,14 @@ internal sealed class RelayConnection : IDisposable
     private readonly TcpClient _client;
     private readonly object _sendLock = new();
 
-    public RelayConnection(TcpClient client)
+    public RelayConnection(TcpClient client, Stream stream)
     {
         _client = client;
         _client.NoDelay = true;
-        Stream = client.GetStream();
+        Stream = stream ?? throw new ArgumentNullException(nameof(stream));
     }
 
-    public NetworkStream Stream { get; }
+    public Stream Stream { get; }
     public string ConnectionId { get; } = Guid.NewGuid().ToString("N");
     public RelayRole Role { get; set; }
     public string PlayerName { get; set; } = string.Empty;
@@ -359,6 +430,7 @@ internal sealed class RelayConnection : IDisposable
 
     public void Dispose()
     {
+        try { Stream.Dispose(); } catch { }
         try { _client.Close(); } catch { }
     }
 }

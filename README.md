@@ -10,6 +10,7 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Uses MelonLoader `v0.7.3` for Unity IL2CPP mod loading.
 - Adds an in-game `Outlanders Multiplayer` menu.
 - Supports `Host Online` and `Join Code` through a relay server.
+- Encrypts and authenticates public relay connections with TLS and hostname validation.
 - Supports `Host Direct` and `Join Direct` for LAN, VPN, or port-forwarded direct IP play.
 - Sends the host's explicitly selected `Endless_*.dat` save as a compressed snapshot.
 - Registers client snapshots as new `Endless_N.dat` slots in the active Outlanders save game.
@@ -100,25 +101,40 @@ Relay mode is what makes worldwide play possible without port forwarding on the 
 
 The relay assigns each joined client a connection ID within its room. Handshake responses and snapshot frames use that ID to reach only the joining client, while host gameplay frames sent without a target are broadcast to every client in the room.
 
-Run this on a VPS, cloud VM, rented server, or any computer that has a public TCP port:
+Public relays require a TLS certificate in PFX/PKCS#12 format. The certificate must contain its private key, be issued by a CA trusted by both players' Windows installations, and contain the relay hostname in its Subject Alternative Name. Configure the PFX password through an environment variable so it is not exposed in the process command line:
 
 ```powershell
-.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668
+$env:OUTLANDERS_RELAY_CERTIFICATE_PASSWORD = "your-pfx-password"
+.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668 --certificate C:\relay\outlanders-relay.pfx
 ```
 
 If you prefer running the DLL:
 
 ```powershell
-dotnet .\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.dll 17668
+dotnet .\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.dll 17668 --certificate C:\relay\outlanders-relay.pfx
 ```
+
+You can set `OUTLANDERS_RELAY_CERTIFICATE_PATH` instead of passing `--certificate`. To read the password from a differently named environment variable, pass `--certificate-password-env VARIABLE_NAME`. The relay never prints certificate passwords, session keys, or join codes.
 
 The optional second and third arguments set the initial join-handshake timeout and the later client-read timeout in seconds. Defaults are 10 seconds and 120 seconds:
 
 ```powershell
-.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668 10 120
+.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668 10 120 --certificate C:\relay\outlanders-relay.pfx
 ```
 
 Connections that do not send a complete join frame or stop sending frames after joining are closed without stopping the relay or disconnecting other rooms.
+
+For local development only, plaintext can be enabled explicitly. This mode binds only to loopback and rejects public listen addresses and client destinations:
+
+```powershell
+# Relay process
+.\artifacts\OutlandersMultiplayer\RelayServer\OutlandersMultiplayer.RelayServer.exe 17668 --allow-insecure-localhost
+
+# Set this before starting Outlanders on each local test client
+$env:OUTLANDERS_RELAY_ALLOW_INSECURE_LOCALHOST = "1"
+```
+
+Do not use the plaintext option on a public machine. Public clients always use TLS, validate the complete certificate chain, and require the certificate name to match the relay host stored in the join code. Direct LAN/VPN mode remains separate and unchanged.
 
 Firewall requirement:
 
@@ -192,6 +208,8 @@ Friend cannot join with the code:
 - Make sure both players use the same mod build.
 - Create a new code and try again.
 - Unreachable relay attempts remain non-blocking and show an overlay error after the 10-second connection timeout.
+- Certificate errors identify the relay hostname. Confirm the certificate is current, trusted by Windows, and contains that exact DNS name (or IP address) in its Subject Alternative Name.
+- Do not paste join codes or session keys into public logs or support messages.
 
 MelonLoader shows remote API or 502/526 warnings:
 
