@@ -2,7 +2,7 @@
 
 Prototype MelonLoader mod for the Steam version of Outlanders.
 
-This project is building toward friend-hosted multiplayer for Sandbox/Endless saves. The current build already installs as a real MelonLoader mod, shows an in-game menu, supports LAN/direct networking, supports online relay join codes, and can transfer a host save snapshot into a safe temporary client slot. Full live gameplay synchronization is still in progress.
+This project is building toward friend-hosted multiplayer for Sandbox/Endless saves. The current build already installs as a real MelonLoader mod, shows an in-game menu, supports LAN/direct networking, supports online relay join codes, and can transfer a host save snapshot into a new client Sandbox slot. Full live gameplay synchronization is still in progress.
 
 ## Current Status
 
@@ -12,7 +12,7 @@ This project is building toward friend-hosted multiplayer for Sandbox/Endless sa
 - Supports `Host Online` and `Join Code` through a relay server.
 - Supports `Host Direct` and `Join Direct` for LAN, VPN, or port-forwarded direct IP play.
 - Sends the host's explicitly selected `Endless_*.dat` save as a compressed snapshot.
-- Writes client snapshots only into `OutlandersMultiplayerTemp`.
+- Registers client snapshots as new `Endless_N.dat` slots in the active Outlanders save game.
 - Does not overwrite normal Outlanders save slots.
 - Live build orders, villagers, resources, decrees, and time sync are not complete yet.
 
@@ -158,11 +158,13 @@ Normal Outlanders saves are not overwritten by client snapshot joining.
 
 The multiplayer overlay shows the exact `user-*\Endless_*.dat` save selected for hosting. Only top-level saves in `user-*` folders are eligible; backup subfolders and `OutlandersMultiplayerTemp` are never hosting candidates. If more than one normal save exists, use the previous/next controls to choose one before starting direct or relay hosting. Hosting refuses to start until that choice is valid.
 
-Client multiplayer snapshots are written under:
+Client multiplayer snapshots are registered under the active save game's `Endless` folder with the first unused slot number:
 
 ```text
-%USERPROFILE%\AppData\LocalLow\Pomelo Games\Outlanders\user-<steamid>\OutlandersMultiplayerTemp\
+%USERPROFILE%\AppData\LocalLow\Pomelo Games\Outlanders\user-<steamid>\<save-id>\Endless\Endless_N.dat
 ```
+
+After the transfer finishes, follow the persistent overlay instruction: return to `Main Menu`, open `Sandbox`, choose `Load`, and select the displayed `Endless_N.dat` slot. Automatic IL2CPP world loading is intentionally deferred until the exact game load API can be invoked safely.
 
 The host still owns the real save. Back up important saves before testing because this is still a prototype mod.
 

@@ -215,6 +215,7 @@ public sealed class MultiplayerController : IDisposable
         _hostSnapshot = null;
         _clientManifest = null;
         _receivedChunks.Clear();
+        _state.ClearRequiredAction();
         _state.SetStatus(SessionStatus.Offline, "Offline");
         _state.SetPlayers(Array.Empty<string>());
     }
@@ -471,17 +472,26 @@ public sealed class MultiplayerController : IDisposable
             return;
         }
 
-        var saveBytes = SnapshotService.Reassemble(_clientManifest, _receivedChunks.Values);
-        var userFolder = OutlandersSaveLocator.FindUserFolder();
-        if (userFolder == null)
+        try
         {
-            _state.SetError("Outlanders user save folder was not found.");
-            return;
-        }
+            var saveBytes = SnapshotService.Reassemble(_clientManifest, _receivedChunks.Values);
+            var userFolder = OutlandersSaveLocator.FindUserFolder();
+            if (userFolder == null)
+            {
+                throw new DirectoryNotFoundException("Outlanders user save folder was not found.");
+            }
 
-        var path = TempSaveWriter.WriteTempSave(userFolder, _clientManifest.SaveName, saveBytes);
-        _state.SetStatus(SessionStatus.Connected, $"Snapshot saved to temp slot: {Path.GetFileName(path)}");
-        _log($"Received snapshot {_clientManifest.SnapshotId}; wrote temp save {path}");
+            var registered = MultiplayerSaveRegistrar.Register(userFolder, saveBytes);
+            var fileName = Path.GetFileName(registered.Path);
+            _state.SetStatus(SessionStatus.Connected, $"Host world registered as {fileName}");
+            _state.SetRequiredAction($"Main Menu > Sandbox > Load > select {fileName}");
+            _log($"Received snapshot {_clientManifest.SnapshotId}; registered multiplayer save {registered.Path}");
+        }
+        catch (Exception ex)
+        {
+            _state.SetError($"Snapshot received, but Outlanders could not register it: {ex.Message}");
+            _log($"Snapshot registration failed: {ex}");
+        }
     }
 
     private uint NextSequence()
