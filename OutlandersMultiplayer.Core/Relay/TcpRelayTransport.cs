@@ -45,7 +45,7 @@ public sealed class TcpRelayTransport : IDisposable
     public event Action? Connected;
     public event Action<string>? ConnectionFailed;
     public event Action<string>? Disconnected;
-    public event Action<ProtocolEnvelope>? MessageReceived;
+    public event Action<string, ProtocolEnvelope>? MessageReceived;
     public event Action<string>? StatusReceived;
     public event Action<string>? Rejected;
 
@@ -98,6 +98,17 @@ public sealed class TcpRelayTransport : IDisposable
     public void Send(ProtocolEnvelope envelope)
     {
         if (envelope == null) throw new ArgumentNullException(nameof(envelope));
+        SendFrame(new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(envelope)));
+    }
+
+    public void SendToClient(string connectionId, ProtocolEnvelope envelope)
+    {
+        if (envelope == null) throw new ArgumentNullException(nameof(envelope));
+        SendFrame(RelayRouting.ToClient(connectionId, ProtocolSerializer.Pack(envelope)));
+    }
+
+    private void SendFrame(RelayFrame frame)
+    {
         var stream = _stream;
         if (!_running || stream == null)
         {
@@ -106,7 +117,7 @@ public sealed class TcpRelayTransport : IDisposable
 
         lock (_sendLock)
         {
-            RelayFrame.Write(stream, new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(envelope)));
+            RelayFrame.Write(stream, frame);
         }
     }
 
@@ -229,7 +240,14 @@ public sealed class TcpRelayTransport : IDisposable
                     case RelayFrameType.Protocol:
                     {
                         var envelope = ProtocolSerializer.Unpack(frame.Payload);
-                        Queue(generation, () => MessageReceived?.Invoke(envelope));
+                        Queue(generation, () => MessageReceived?.Invoke(string.Empty, envelope));
+                        break;
+                    }
+                    case RelayFrameType.RoutedProtocol:
+                    {
+                        var route = RelayRoute.FromPayload(frame.Payload);
+                        var envelope = ProtocolSerializer.Unpack(route.ProtocolPayload);
+                        Queue(generation, () => MessageReceived?.Invoke(route.ConnectionId, envelope));
                         break;
                     }
                     case RelayFrameType.Status:

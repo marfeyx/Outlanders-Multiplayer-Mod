@@ -103,7 +103,7 @@ public sealed class RelayServer
                     _clientReadTimeout,
                     cancellationToken,
                     "client frame");
-                if (frame.Type == RelayFrameType.Protocol)
+                if (frame.Type is RelayFrameType.Protocol or RelayFrameType.RoutedProtocol)
                 {
                     room.Forward(connection, frame);
                 }
@@ -220,7 +220,7 @@ internal static class RelayFrameReader
 internal sealed class RelayRoom
 {
     private readonly object _sync = new();
-    private readonly List<RelayConnection> _clients = new();
+    private readonly Dictionary<string, RelayConnection> _clients = new(StringComparer.Ordinal);
     private RelayConnection? _host;
     private string _sessionKey = string.Empty;
 
@@ -272,7 +272,7 @@ internal sealed class RelayRoom
                 return false;
             }
 
-            _clients.Add(connection);
+            _clients.Add(connection.ConnectionId, connection);
             rejection = string.Empty;
             return true;
         }
@@ -284,14 +284,25 @@ internal sealed class RelayRoom
         {
             if (sender == _host)
             {
-                foreach (var client in _clients.ToArray())
+                var recipients = RelayRouting.SelectHostRecipients(frame, _clients.Keys);
+                var clientFrame = RelayRouting.ForClient(frame);
+                foreach (var connectionId in recipients)
                 {
-                    client.Send(frame);
+                    if (_clients.TryGetValue(connectionId, out var client))
+                    {
+                        client.Send(clientFrame);
+                    }
                 }
             }
             else
             {
-                _host?.Send(frame);
+                if (frame.Type != RelayFrameType.Protocol)
+                {
+                    sender.Send(RelayFrame.Rejected("Clients may not supply relay routing metadata."));
+                    return;
+                }
+
+                _host?.Send(RelayRouting.FromClient(sender.ConnectionId, frame));
             }
         }
     }
@@ -303,7 +314,7 @@ internal sealed class RelayRoom
             if (connection == _host)
             {
                 _host = null;
-                foreach (var client in _clients.ToArray())
+                foreach (var client in _clients.Values.ToArray())
                 {
                     client.Send(RelayFrame.Rejected("Host disconnected."));
                     client.Dispose();
@@ -313,7 +324,7 @@ internal sealed class RelayRoom
             }
             else
             {
-                _clients.Remove(connection);
+                _clients.Remove(connection.ConnectionId);
             }
         }
     }
@@ -332,6 +343,7 @@ internal sealed class RelayConnection : IDisposable
     }
 
     public NetworkStream Stream { get; }
+    public string ConnectionId { get; } = Guid.NewGuid().ToString("N");
     public RelayRole Role { get; set; }
     public string PlayerName { get; set; } = string.Empty;
     public string RoomCode { get; set; } = string.Empty;

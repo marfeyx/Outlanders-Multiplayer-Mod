@@ -96,6 +96,8 @@ Your friend should not need to type relay host, relay port, session key, or room
 
 Relay mode is what makes worldwide play possible without port forwarding on the host's home router.
 
+The relay assigns each joined client a connection ID within its room. Handshake responses and snapshot frames use that ID to reach only the joining client, while host gameplay frames sent without a target are broadcast to every client in the room.
+
 Run this on a VPS, cloud VM, rented server, or any computer that has a public TCP port:
 
 ```powershell
