@@ -35,7 +35,12 @@ public static class HandshakeValidator
             return Reject($"Unity runtime {Display(request.UnityVersion)} does not match host runtime {host.UnityVersion}.");
         }
 
-        if (!string.IsNullOrEmpty(expectedSessionKey) && request.SessionKey != expectedSessionKey)
+        if (string.IsNullOrWhiteSpace(expectedSessionKey))
+        {
+            return Reject("The host session key is missing.");
+        }
+
+        if (string.IsNullOrWhiteSpace(request.SessionKey) || request.SessionKey != expectedSessionKey)
         {
             return Reject("Session key is incorrect.");
         }

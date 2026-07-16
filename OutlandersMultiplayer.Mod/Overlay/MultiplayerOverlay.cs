@@ -51,8 +51,8 @@ public sealed class MultiplayerOverlay
         const float pad = 14f;
         var requiredAction = _controller.State.RequiredAction;
         var actionHeight = string.IsNullOrWhiteSpace(requiredAction) ? 0f : 62f;
-        var panelHeight = (_showAdvanced ? 616f : 466f) + actionHeight;
-        var formHeight = _showAdvanced ? 356f : 208f;
+        var panelHeight = (_showAdvanced ? 694f : 466f) + actionHeight;
+        var formHeight = _showAdvanced ? 434f : 208f;
         var y = y0;
 
         DrawBox(x, y, width, panelHeight, 0.13f, 0.15f, 0.13f, " ");
@@ -125,9 +125,25 @@ public sealed class MultiplayerOverlay
             y += 34;
             DrawField(x + 36, y, "Direct Port", ref _port, 8);
             y += 38;
+            DrawField(x + 36, y, "Direct Key", ref _sessionKey, ProtocolConstants.MaxSessionKeyBytes);
+            y += 34;
+
+            if (DrawButton(x + 36, y, 126, 30, "New Key", 0.30f, 0.38f, 0.31f))
+            {
+                GenerateDirectSessionKey();
+            }
+
+            if (DrawButton(x + 170, y, 126, 30, "Copy Key", 0.35f, 0.38f, 0.30f))
+            {
+                EnsureDirectSessionKey();
+                _gui.SetClipboard(_sessionKey);
+            }
+
+            y += 40;
 
             if (DrawButton(x + 36, y, 126, 30, "Host Direct", 0.32f, 0.42f, 0.32f))
             {
+                EnsureDirectSessionKey();
                 _controller.Host(ParsePort(), _sessionKey);
             }
 
@@ -241,6 +257,19 @@ public sealed class MultiplayerOverlay
         _roomCode = code.RoomCode;
         _sessionKey = code.SessionKey;
         _controller.JoinViaRelay(code.RelayHost, code.RelayPort, code.RoomCode, code.SessionKey, _playerName);
+    }
+
+    private void EnsureDirectSessionKey()
+    {
+        if (string.IsNullOrWhiteSpace(_sessionKey))
+        {
+            GenerateDirectSessionKey();
+        }
+    }
+
+    private void GenerateDirectSessionKey()
+    {
+        _sessionKey = JoinCode.CreateSessionKey();
     }
 
     private int ParsePort()
