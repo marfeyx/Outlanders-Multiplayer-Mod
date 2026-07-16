@@ -25,6 +25,9 @@ public static class TestRunner
             ("protocol envelope round-trips", ProtocolEnvelopeRoundTrips),
             ("handshake rejects wrong build", HandshakeRejectsWrongBuild),
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
+            ("direct live sync accepts and applies commands once", DirectLiveSyncAcceptsAndAppliesOnce),
+            ("relay live sync routes accepted commands once", RelayLiveSyncRoutesAcceptedCommandsOnce),
+            ("live sync state hashes detect divergence", LiveSyncStateHashesDetectDivergence),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("multiplayer snapshots register without overwriting saves", MultiplayerSnapshotsRegisterWithoutOverwritingSaves),
@@ -87,6 +90,104 @@ public static class TestRunner
         var filter = new DuplicateSequenceFilter();
         Assert(filter.Accept(10), "first sequence should be accepted");
         Assert(!filter.Accept(10), "duplicate sequence should be rejected");
+        Assert(!filter.Accept(9), "out-of-order sequence should be rejected");
+        Assert(filter.Accept(11), "newer sequence should be accepted");
+    }
+
+    private static void DirectLiveSyncAcceptsAndAppliesOnce()
+    {
+        var host = new LiveSyncHost();
+        var client = new LiveSyncClient();
+        host.RegisterPlayer("direct:2", 2);
+
+        var intent = IntentEnvelope(sequence: 10, playerId: 2, tick: 42, commandType: "PlaceRoad");
+        Assert(host.TryAcceptIntent("direct:2", intent, out var accepted, out var rejection), rejection);
+        Assert(accepted != null, "host should produce an accepted command");
+        Assert(accepted!.CommandId == 1, "host should assign the first authoritative command ID");
+
+        var broadcast = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, 100, accepted.ToPayload());
+        var applied = 0;
+        if (client.TryAcceptCommand(broadcast, out var received, out rejection))
+        {
+            applied++;
+            Assert(received!.CommandType == "PlaceRoad", "client received wrong command");
+        }
+
+        if (client.TryAcceptCommand(broadcast, out _, out _))
+        {
+            applied++;
+        }
+
+        Assert(applied == 1, "accepted command should be applied exactly once");
+        Assert(!host.TryAcceptIntent("direct:2", intent, out _, out rejection), "duplicate intent should be rejected");
+        Assert(rejection.Contains("duplicate or out of order", StringComparison.Ordinal), "duplicate rejection should be explicit");
+
+        var older = IntentEnvelope(sequence: 9, playerId: 2, tick: 43, commandType: "PlaceRoad");
+        Assert(!host.TryAcceptIntent("direct:2", older, out _, out _), "out-of-order intent should be rejected");
+    }
+
+    private static void RelayLiveSyncRoutesAcceptedCommandsOnce()
+    {
+        const string connectionId = "relay-client-7";
+        var host = new LiveSyncHost();
+        var client = new LiveSyncClient();
+        host.RegisterPlayer(connectionId, 7);
+
+        var intent = IntentEnvelope(sequence: 20, playerId: 7, tick: 90, commandType: "SetWorkArea");
+        var clientFrame = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(intent));
+        var routedToHost = RelayRouting.FromClient(connectionId, clientFrame);
+        var hostRoute = RelayRoute.FromPayload(routedToHost.Payload);
+        var hostEnvelope = ProtocolSerializer.Unpack(hostRoute.ProtocolPayload);
+
+        Assert(hostRoute.ConnectionId == connectionId, "relay sender identity was not preserved");
+        Assert(host.TryAcceptIntent(hostRoute.ConnectionId, hostEnvelope, out var accepted, out var rejection), rejection);
+
+        var broadcast = new ProtocolEnvelope(ProtocolMessageType.AcceptedCommand, 200, accepted!.ToPayload());
+        var broadcastFrame = new RelayFrame(RelayFrameType.Protocol, ProtocolSerializer.Pack(broadcast));
+        var recipients = RelayRouting.SelectHostRecipients(broadcastFrame, new[] { connectionId, "relay-client-8" });
+        var deliveredFrame = RelayRouting.ForClient(broadcastFrame);
+        var delivered = ProtocolSerializer.Unpack(deliveredFrame.Payload);
+
+        Assert(recipients.Count == 2, "accepted relay command should broadcast to every room client");
+        Assert(client.TryAcceptCommand(delivered, out var received, out rejection), rejection);
+        Assert(received!.CommandType == "SetWorkArea", "relay client received wrong command");
+        Assert(!client.TryAcceptCommand(delivered, out _, out _), "relay duplicate should not be applied twice");
+
+        var spoofed = IntentEnvelope(sequence: 21, playerId: 8, tick: 91, commandType: "SetWorkArea");
+        Assert(!host.TryAcceptIntent(connectionId, spoofed, out _, out rejection), "spoofed relay player ID should be rejected");
+        Assert(rejection.Contains("sender is player 7", StringComparison.Ordinal), "spoof rejection should identify assigned player");
+    }
+
+    private static void LiveSyncStateHashesDetectDivergence()
+    {
+        var host = new LiveSyncHost();
+        var client = new LiveSyncClient();
+        host.RegisterPlayer("direct:2", 2);
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-state"));
+        var clientHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("client-state"));
+        var authoritative = new SimulationStateHash { PlayerId = 1, SimulationTick = 50, Hash = hostHash };
+        var local = new SimulationStateHash { PlayerId = 2, SimulationTick = 50, Hash = clientHash };
+        host.SetAuthoritativeStateHash(authoritative);
+        client.RecordLocalStateHash(local);
+
+        var report = new ProtocolEnvelope(ProtocolMessageType.StateHash, 30, local.ToPayload());
+        Assert(host.TryCheckStateHash(
+            "direct:2", report, out var received, out var divergent, out var expected, out var rejection), rejection);
+        Assert(received!.SimulationTick == 50, "host received wrong state hash tick");
+        Assert(divergent, "host should detect state divergence");
+        Assert(expected == hostHash, "host should return authoritative hash");
+
+        var response = new ProtocolEnvelope(ProtocolMessageType.StateHash, 300, authoritative.ToPayload());
+        Assert(client.TryCompareAuthoritativeStateHash(
+            response, out _, out divergent, out var actual, out rejection), rejection);
+        Assert(divergent, "client should detect state divergence");
+        Assert(actual == clientHash, "client should report its local hash");
+
+        client.Reset();
+        client.RecordLocalStateHash(authoritative);
+        Assert(client.TryCompareAuthoritativeStateHash(
+            response, out _, out divergent, out _, out rejection), rejection);
+        Assert(!divergent, "matching state hashes should not report divergence");
     }
 
     private static void SnapshotChunksReassembleAndValidate()
@@ -395,6 +496,19 @@ public static class TestRunner
         Assert(decoded.RelayPort == 17668, "relay port mismatch");
         Assert(decoded.RoomCode == "ROOM123", "room code mismatch");
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
+    }
+
+    private static ProtocolEnvelope IntentEnvelope(uint sequence, uint playerId, long tick, string commandType)
+    {
+        var intent = new CommandEnvelope
+        {
+            CommandId = 0,
+            PlayerId = playerId,
+            SimulationTick = tick,
+            CommandType = commandType,
+            JsonPayload = "{\"synthetic\":true}"
+        };
+        return new ProtocolEnvelope(ProtocolMessageType.PlayerIntent, sequence, intent.ToPayload());
     }
 
     private static void RelayRoutingIsolatesTargetedClients()
