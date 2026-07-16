@@ -214,9 +214,10 @@ public sealed class MultiplayerOverlay
 
     private void HostOnline()
     {
-        if (IsLocalRelayHost(_relayHost))
+        if (IsLocalRelayHost(_relayHost) && !_controller.AllowsInsecureLocalRelay)
         {
-            _controller.State.SetError("Set a public relay host in Advanced before hosting online.");
+            _controller.State.SetError(
+                $"Set a public relay host, or enable {MultiplayerController.InsecureLocalRelayEnvironmentVariable}=1 for local development.");
             _showAdvanced = true;
             return;
         }

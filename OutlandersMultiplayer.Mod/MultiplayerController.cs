@@ -16,6 +16,8 @@ namespace OutlandersMultiplayer.Mod;
 
 public sealed class MultiplayerController : IDisposable
 {
+    public const string InsecureLocalRelayEnvironmentVariable = "OUTLANDERS_RELAY_ALLOW_INSECURE_LOCALHOST";
+
     private readonly SessionState _state;
     private readonly Action<string> _log;
     private readonly RuntimeCompatibility _compatibility;
@@ -49,6 +51,11 @@ public sealed class MultiplayerController : IDisposable
 
     public SessionState State => _state;
     public uint LocalPlayerId => _localPlayerId;
+    public bool AllowsInsecureLocalRelay =>
+        string.Equals(
+            Environment.GetEnvironmentVariable(InsecureLocalRelayEnvironmentVariable),
+            "1",
+            StringComparison.Ordinal);
 
     public event Action<CommandEnvelope>? AcceptedCommandReceived;
     public event Action<long, string, string>? StateDivergenceDetected;
@@ -163,7 +170,7 @@ public sealed class MultiplayerController : IDisposable
         }
 
         InitializeHostLiveSync();
-        _relayTransport = new TcpRelayTransport();
+        _relayTransport = CreateRelayTransport(relayHost);
         _relayTransport.Connected += () => _state.SetStatus(SessionStatus.Hosting, $"Relay host room {roomCode}");
         _relayTransport.ConnectionFailed += reason => _state.SetError(reason);
         _relayTransport.StatusReceived += status => _log($"Relay status: {status}");
@@ -195,7 +202,7 @@ public sealed class MultiplayerController : IDisposable
         _receivedChunks.Clear();
         _clientManifest = null;
 
-        _relayTransport = new TcpRelayTransport();
+        _relayTransport = CreateRelayTransport(relayHost);
         _relayTransport.Connected += () =>
         {
             _state.SetStatus(SessionStatus.Connected, $"Connected to relay room {roomCode}");
@@ -232,6 +239,17 @@ public sealed class MultiplayerController : IDisposable
             _state.SetError(ex.Message);
             _log(ex.ToString());
         }
+    }
+
+    private TcpRelayTransport CreateRelayTransport(string relayHost)
+    {
+        if (AllowsInsecureLocalRelay && RelayTransportSecurity.IsLiteralLoopback(relayHost))
+        {
+            _log("WARNING: using plaintext relay transport for loopback development only.");
+            return new TcpRelayTransport(security: RelayTransportSecurity.InsecureLocalhost);
+        }
+
+        return new TcpRelayTransport();
     }
 
     public void Disconnect()

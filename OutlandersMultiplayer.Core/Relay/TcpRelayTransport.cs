@@ -3,7 +3,10 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,9 +24,11 @@ public sealed class TcpRelayTransport : IDisposable
     private readonly object _sendLock = new();
     private readonly TimeSpan _connectTimeout;
     private readonly Func<TcpClient, string, int, Task> _connectAsync;
+    private readonly RelayTransportSecurity _security;
+    private readonly RemoteCertificateValidationCallback? _certificateValidationCallback;
     private CancellationTokenSource? _lifetime;
     private TcpClient? _client;
-    private NetworkStream? _stream;
+    private Stream? _stream;
     private int _generation;
     private volatile bool _connecting;
     private volatile bool _running;
@@ -31,7 +36,17 @@ public sealed class TcpRelayTransport : IDisposable
 
     public TcpRelayTransport(
         TimeSpan? connectTimeout = null,
-        Func<TcpClient, string, int, Task>? connectAsync = null)
+        Func<TcpClient, string, int, Task>? connectAsync = null,
+        RelayTransportSecurity? security = null)
+        : this(connectTimeout, connectAsync, security, certificateValidationCallback: null)
+    {
+    }
+
+    internal TcpRelayTransport(
+        TimeSpan? connectTimeout,
+        Func<TcpClient, string, int, Task>? connectAsync,
+        RelayTransportSecurity? security,
+        RemoteCertificateValidationCallback? certificateValidationCallback)
     {
         _connectTimeout = connectTimeout ?? DefaultConnectTimeout;
         if (_connectTimeout <= TimeSpan.Zero)
@@ -40,6 +55,8 @@ public sealed class TcpRelayTransport : IDisposable
         }
 
         _connectAsync = connectAsync ?? ((client, host, port) => client.ConnectAsync(host, port));
+        _security = security ?? RelayTransportSecurity.Tls;
+        _certificateValidationCallback = certificateValidationCallback;
     }
 
     public event Action? Connected;
@@ -58,6 +75,11 @@ public sealed class TcpRelayTransport : IDisposable
         if (string.IsNullOrWhiteSpace(relayHost)) throw new ArgumentException("Relay host is required.", nameof(relayHost));
         if (relayPort <= 0 || relayPort > 65535) throw new ArgumentOutOfRangeException(nameof(relayPort));
         if (joinRequest == null) throw new ArgumentNullException(nameof(joinRequest));
+        if (_security.AllowInsecureLocalhost && !RelayTransportSecurity.IsLiteralLoopback(relayHost))
+        {
+            throw new InvalidOperationException(
+                "Plaintext relay connections are restricted to literal localhost or loopback IP addresses.");
+        }
 
         Stop();
 
@@ -171,7 +193,32 @@ public sealed class TcpRelayTransport : IDisposable
                 try
                 {
                     await AwaitWithCancellation(_connectAsync(client, relayHost, relayPort), connectPhase.Token).ConfigureAwait(false);
-                    var stream = client.GetStream();
+                    Stream stream = client.GetStream();
+                    if (!_security.AllowInsecureLocalhost)
+                    {
+                        var tlsStream = new SslStream(
+                            stream,
+                            leaveInnerStreamOpen: false,
+                            _certificateValidationCallback);
+                        try
+                        {
+                            await AwaitWithCancellation(
+                                tlsStream.AuthenticateAsClientAsync(relayHost),
+                                connectPhase.Token).ConfigureAwait(false);
+                        }
+                        catch (AuthenticationException ex)
+                        {
+                            tlsStream.Dispose();
+                            throw new AuthenticationException(
+                                $"TLS certificate validation failed for relay '{relayHost}'. " +
+                                "Use a certificate issued by a trusted authority whose name matches the relay host. " +
+                                $"TLS reported: {ex.GetBaseException().Message}",
+                                ex);
+                        }
+
+                        stream = tlsStream;
+                    }
+
                     var joinFrame = SerializeFrame(new RelayFrame(RelayFrameType.Join, joinRequest.ToPayload()));
                     await stream.WriteAsync(joinFrame, 0, joinFrame.Length, connectPhase.Token).ConfigureAwait(false);
 
@@ -194,7 +241,11 @@ public sealed class TcpRelayTransport : IDisposable
             }
 
             Queue(generation, () => Connected?.Invoke());
-            await ReadLoopAsync(generation, client.GetStream(), lifetime.Token).ConfigureAwait(false);
+            var activeStream = _stream;
+            if (activeStream != null)
+            {
+                await ReadLoopAsync(generation, activeStream, lifetime.Token).ConfigureAwait(false);
+            }
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
         {
