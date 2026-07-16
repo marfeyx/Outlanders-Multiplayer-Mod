@@ -28,6 +28,7 @@ public static class TestRunner
         {
             ("protocol envelope round-trips", ProtocolEnvelopeRoundTrips),
             ("handshake payload carries runtime compatibility", HandshakePayloadCarriesRuntimeCompatibility),
+            ("handshake requires non-empty session keys", HandshakeRequiresNonEmptySessionKeys),
             ("handshake rejects incompatible runtime metadata", HandshakeRejectsIncompatibleRuntimeMetadata),
             ("handshake save hash controls resync", HandshakeSaveHashControlsResync),
             ("snapshot hash gate requires handshake and exact snapshot", SnapshotHashGateRequiresHandshakeAndExactSnapshot),
@@ -126,6 +127,33 @@ public static class TestRunner
         wrongUnity.UnityVersion = "different-unity";
         AssertRejected(wrongUnity, hostHash, "does not match host runtime");
     }
+
+    private static void HandshakeRequiresNonEmptySessionKeys()
+    {
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var accepted = Validate(CompatibleRequest(hostHash), hostHash);
+        Assert(accepted.Accepted, $"matching non-empty session key should be accepted: {accepted.Reason}");
+
+        var request = CompatibleRequest(hostHash);
+        var missingHostKey = HandshakeValidator.ValidateForHost(request, string.Empty, CompatibleRuntime(), hostHash);
+        Assert(!missingHostKey.Accepted, "empty host session key should reject handshakes");
+        Assert(missingHostKey.Reason.Contains("session key", StringComparison.OrdinalIgnoreCase),
+            $"empty host key rejection should mention session key: {missingHostKey.Reason}");
+
+        var missingClientKey = CompatibleRequest(hostHash);
+        missingClientKey.SessionKey = string.Empty;
+        var missingClientResponse = HandshakeValidator.ValidateForHost(missingClientKey, "secret", CompatibleRuntime(), hostHash);
+        Assert(!missingClientResponse.Accepted, "empty client session key should be rejected");
+        Assert(missingClientResponse.Reason.Contains("Session key", StringComparison.Ordinal),
+            $"empty client key rejection should mention session key: {missingClientResponse.Reason}");
+
+        var wrongClientKey = CompatibleRequest(hostHash);
+        wrongClientKey.SessionKey = "wrong-secret";
+        var wrongClientResponse = HandshakeValidator.ValidateForHost(wrongClientKey, "secret", CompatibleRuntime(), hostHash);
+        Assert(!wrongClientResponse.Accepted, "wrong client session key should be rejected");
+    }
+
+    private const string TestSessionKey = "secret";
 
     private static void HandshakeSaveHashControlsResync()
     {
@@ -1047,13 +1075,14 @@ public static class TestRunner
             OutlandersBuildGuid = runtime.OutlandersBuildGuid,
             UnityVersion = runtime.UnityVersion,
             ModVersion = runtime.ModVersion,
+            SessionKey = TestSessionKey,
             SaveHash = saveHash
         };
     }
 
     private static HandshakeResponse Validate(HandshakeRequest request, string hostHash)
     {
-        return HandshakeValidator.ValidateForHost(request, string.Empty, CompatibleRuntime(), hostHash);
+        return HandshakeValidator.ValidateForHost(request, TestSessionKey, CompatibleRuntime(), hostHash);
     }
 
     private static void AssertRejected(HandshakeRequest request, string hostHash, string reasonFragment)

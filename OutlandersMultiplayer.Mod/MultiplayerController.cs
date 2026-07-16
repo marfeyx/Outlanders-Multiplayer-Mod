@@ -103,7 +103,7 @@ public sealed class MultiplayerController : IDisposable
     {
         Disconnect();
         if (!EnsureRuntimeCompatibility()) return;
-        _sessionKey = sessionKey ?? string.Empty;
+        if (!TrySetSessionKey(sessionKey, "Direct hosting")) return;
 
         if (!TryPrepareHostSnapshot(out var savePath))
         {
@@ -138,7 +138,7 @@ public sealed class MultiplayerController : IDisposable
         Disconnect();
         if (!EnsureRuntimeCompatibility()) return;
         _isHost = false;
-        _sessionKey = sessionKey ?? string.Empty;
+        if (!TrySetSessionKey(sessionKey, "Direct join")) return;
         _snapshotReceiver.Reset();
 
         _transport = new LiteNetLibDirectTransport();
@@ -160,7 +160,7 @@ public sealed class MultiplayerController : IDisposable
     {
         Disconnect();
         if (!EnsureRuntimeCompatibility()) return;
-        _sessionKey = sessionKey ?? string.Empty;
+        if (!TrySetSessionKey(sessionKey, "Relay hosting")) return;
 
         if (!TryPrepareHostSnapshot(out var savePath))
         {
@@ -196,7 +196,7 @@ public sealed class MultiplayerController : IDisposable
         Disconnect();
         if (!EnsureRuntimeCompatibility()) return;
         _isHost = false;
-        _sessionKey = sessionKey ?? string.Empty;
+        if (!TrySetSessionKey(sessionKey, "Relay join")) return;
         _snapshotReceiver.Reset();
 
         _relayTransport = CreateRelayTransport(relayHost);
@@ -824,6 +824,19 @@ public sealed class MultiplayerController : IDisposable
         if (_compatibility.IsComplete) return true;
         _state.SetError("Could not determine the running Outlanders build, Unity runtime, or mod version.");
         return false;
+    }
+
+    private bool TrySetSessionKey(string sessionKey, string operation)
+    {
+        var normalized = (sessionKey ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            _state.SetError($"{operation} requires a non-empty session key.");
+            return false;
+        }
+
+        _sessionKey = normalized;
+        return true;
     }
 
     private bool AcceptAndBroadcastIntent(string senderId, ProtocolEnvelope envelope, Action<string> reject)
