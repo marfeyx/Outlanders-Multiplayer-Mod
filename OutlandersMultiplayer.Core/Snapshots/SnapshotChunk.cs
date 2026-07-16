@@ -13,6 +13,7 @@ public sealed class SnapshotChunk
 
     public byte[] ToPayload()
     {
+        ValidateBasic();
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
         ProtocolStrings.WriteBounded(writer, SnapshotId, 64);
@@ -30,16 +31,39 @@ public sealed class SnapshotChunk
         var snapshotId = ProtocolStrings.ReadBounded(reader, 64);
         var index = reader.ReadInt32();
         var length = reader.ReadInt32();
-        if (length < 0 || length > stream.Length - stream.Position)
+        if (length < 0 || length > SnapshotLimits.MaxChunkBytes || length != stream.Length - stream.Position)
         {
             throw new InvalidDataException("Snapshot chunk length is invalid.");
         }
 
-        return new SnapshotChunk
+        var chunk = new SnapshotChunk
         {
             SnapshotId = snapshotId,
             Index = index,
             Data = reader.ReadBytes(length)
         };
+
+        chunk.ValidateBasic();
+        return chunk;
+    }
+
+    public void ValidateBasic()
+    {
+        if (string.IsNullOrWhiteSpace(SnapshotId) ||
+            Encoding.UTF8.GetByteCount(SnapshotId) > SnapshotManifest.MaxSnapshotIdBytes)
+        {
+            throw new InvalidDataException("Snapshot chunk ID is missing or too long.");
+        }
+
+        if (Index < 0)
+        {
+            throw new InvalidDataException("Snapshot chunk index cannot be negative.");
+        }
+
+        if (Data == null || Data.Length == 0 || Data.Length > SnapshotLimits.MaxChunkBytes)
+        {
+            throw new InvalidDataException(
+                $"Snapshot chunk data must be between 1 and {SnapshotLimits.MaxChunkBytes} bytes.");
+        }
     }
 }
