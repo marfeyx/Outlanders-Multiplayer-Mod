@@ -45,7 +45,7 @@ public sealed class RelayFrame
             throw new InvalidDataException("Relay frame length is invalid.");
         }
 
-        using var payload = new MemoryStream(reader.ReadBytes(length), writable: false);
+        using var payload = new MemoryStream(ReadExactly(reader, length, "relay frame body"), writable: false);
         using var payloadReader = new BinaryReader(payload, Encoding.UTF8, leaveOpen: false);
         var type = (RelayFrameType)payloadReader.ReadByte();
         var payloadLength = payloadReader.ReadInt32();
@@ -54,7 +54,25 @@ public sealed class RelayFrame
             throw new InvalidDataException("Relay payload length is invalid.");
         }
 
-        return new RelayFrame(type, payloadReader.ReadBytes(payloadLength));
+        return new RelayFrame(type, ReadExactly(payloadReader, payloadLength, "relay frame payload"));
+    }
+
+    private static byte[] ReadExactly(BinaryReader reader, int length, string description)
+    {
+        var bytes = new byte[length];
+        var offset = 0;
+        while (offset < length)
+        {
+            var bytesRead = reader.Read(bytes, offset, length - offset);
+            if (bytesRead == 0)
+            {
+                throw new EndOfStreamException($"Unexpected end of stream while reading {description}. Expected {length} bytes but received {offset}.");
+            }
+
+            offset += bytesRead;
+        }
+
+        return bytes;
     }
 
     public static RelayFrame Rejected(string reason)
