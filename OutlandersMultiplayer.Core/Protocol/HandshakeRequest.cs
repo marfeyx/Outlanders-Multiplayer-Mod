@@ -7,8 +7,10 @@ public sealed class HandshakeRequest
 {
     public string PlayerName { get; set; } = "Player";
     public string SessionKey { get; set; } = string.Empty;
-    public string OutlandersBuildGuid { get; set; } = ProtocolConstants.ExpectedOutlandersBuildGuid;
-    public string UnityVersion { get; set; } = ProtocolConstants.ExpectedUnityVersion;
+    public ushort ProtocolVersion { get; set; } = ProtocolConstants.ProtocolVersion;
+    public string OutlandersBuildGuid { get; set; } = string.Empty;
+    public string UnityVersion { get; set; } = string.Empty;
+    public string ModVersion { get; set; } = string.Empty;
     public string SaveHash { get; set; } = string.Empty;
 
     public byte[] ToPayload()
@@ -20,6 +22,8 @@ public sealed class HandshakeRequest
         ProtocolStrings.WriteBounded(writer, OutlandersBuildGuid, 128);
         ProtocolStrings.WriteBounded(writer, UnityVersion, 32);
         ProtocolStrings.WriteBounded(writer, SaveHash, 128);
+        writer.Write(ProtocolVersion);
+        ProtocolStrings.WriteBounded(writer, ModVersion, 64);
         writer.Flush();
         return stream.ToArray();
     }
@@ -28,7 +32,7 @@ public sealed class HandshakeRequest
     {
         using var stream = new MemoryStream(payload, writable: false);
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
-        return new HandshakeRequest
+        var request = new HandshakeRequest
         {
             PlayerName = ProtocolStrings.ReadBounded(reader, ProtocolConstants.MaxPlayerNameBytes),
             SessionKey = ProtocolStrings.ReadBounded(reader, ProtocolConstants.MaxSessionKeyBytes),
@@ -36,5 +40,17 @@ public sealed class HandshakeRequest
             UnityVersion = ProtocolStrings.ReadBounded(reader, 32),
             SaveHash = ProtocolStrings.ReadBounded(reader, 128)
         };
+
+        if (stream.Position < stream.Length)
+        {
+            request.ProtocolVersion = reader.ReadUInt16();
+            request.ModVersion = ProtocolStrings.ReadBounded(reader, 64);
+        }
+        else
+        {
+            request.ProtocolVersion = 0;
+        }
+
+        return request;
     }
 }

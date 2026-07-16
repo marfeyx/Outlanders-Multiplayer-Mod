@@ -18,10 +18,12 @@ public sealed class MultiplayerController : IDisposable
 {
     private readonly SessionState _state;
     private readonly Action<string> _log;
+    private readonly RuntimeCompatibility _compatibility;
     private readonly Dictionary<string, SnapshotChunk> _receivedChunks = new();
     private readonly Dictionary<string, string> _relayPlayerNames = new(StringComparer.Ordinal);
     private readonly LiveSyncHost _liveSyncHost = new();
     private readonly LiveSyncClient _liveSyncClient = new();
+    private readonly SnapshotHashTracker _snapshotHashes = new();
     private LiteNetLibDirectTransport? _transport;
     private TcpRelayTransport? _relayTransport;
     private SnapshotPackage? _hostSnapshot;
@@ -29,6 +31,7 @@ public sealed class MultiplayerController : IDisposable
     private uint _nextSequence = 1;
     private uint _nextPlayerId = 2;
     private string _sessionKey = string.Empty;
+    private string _expectedHostSaveHash = string.Empty;
     private uint _localPlayerId;
     private bool _isHost;
 
@@ -36,10 +39,11 @@ public sealed class MultiplayerController : IDisposable
     private IReadOnlyList<string> _hostingSaveCandidates = Array.Empty<string>();
     private string? _selectedHostingSavePath;
 
-    public MultiplayerController(SessionState state, Action<string> log)
+    public MultiplayerController(SessionState state, Action<string> log, RuntimeCompatibility? compatibility = null)
     {
         _state = state;
         _log = log;
+        _compatibility = compatibility ?? RuntimeCompatibilityProvider.Capture();
         RefreshHostingSaveSelection();
     }
 
@@ -92,6 +96,7 @@ public sealed class MultiplayerController : IDisposable
     public void Host(int port, string sessionKey)
     {
         Disconnect();
+        if (!EnsureRuntimeCompatibility()) return;
         _sessionKey = sessionKey ?? string.Empty;
 
         if (!TryPrepareHostSnapshot(out var savePath))
@@ -109,7 +114,9 @@ public sealed class MultiplayerController : IDisposable
         };
         _transport.PeerDisconnected += (peer, info) =>
         {
-            _liveSyncHost.UnregisterPlayer(DirectSenderId(peer));
+            var senderId = DirectSenderId(peer);
+            _liveSyncHost.UnregisterPlayer(senderId);
+            _snapshotHashes.UnregisterPeer(senderId);
             _state.SetPlayers(new[] { "Host" });
             _log($"Client disconnected: {peer} ({info.Reason})");
         };
@@ -123,6 +130,7 @@ public sealed class MultiplayerController : IDisposable
     public void Join(string host, int port, string sessionKey, string playerName)
     {
         Disconnect();
+        if (!EnsureRuntimeCompatibility()) return;
         _isHost = false;
         _sessionKey = sessionKey ?? string.Empty;
         _receivedChunks.Clear();
@@ -146,6 +154,7 @@ public sealed class MultiplayerController : IDisposable
     public void HostViaRelay(string relayHost, int relayPort, string roomCode, string sessionKey)
     {
         Disconnect();
+        if (!EnsureRuntimeCompatibility()) return;
         _sessionKey = sessionKey ?? string.Empty;
 
         if (!TryPrepareHostSnapshot(out var savePath))
@@ -180,6 +189,7 @@ public sealed class MultiplayerController : IDisposable
     public void JoinViaRelay(string relayHost, int relayPort, string roomCode, string sessionKey, string playerName)
     {
         Disconnect();
+        if (!EnsureRuntimeCompatibility()) return;
         _isHost = false;
         _sessionKey = sessionKey ?? string.Empty;
         _receivedChunks.Clear();
@@ -234,10 +244,12 @@ public sealed class MultiplayerController : IDisposable
         _relayTransport = null;
         _hostSnapshot = null;
         _clientManifest = null;
+        _expectedHostSaveHash = string.Empty;
         _receivedChunks.Clear();
         _relayPlayerNames.Clear();
         _liveSyncHost.Reset();
         _liveSyncClient.Reset();
+        _snapshotHashes.Reset();
         _localPlayerId = 0;
         _isHost = false;
         _nextPlayerId = 2;
@@ -452,11 +464,16 @@ public sealed class MultiplayerController : IDisposable
 
     private void SendHandshake(string playerName)
     {
+        var localSaveHash = GetLocalSaveHash();
         var request = new HandshakeRequest
         {
             PlayerName = string.IsNullOrWhiteSpace(playerName) ? Environment.UserName : playerName,
             SessionKey = _sessionKey,
-            SaveHash = string.Empty
+            ProtocolVersion = _compatibility.ProtocolVersion,
+            OutlandersBuildGuid = _compatibility.OutlandersBuildGuid,
+            UnityVersion = _compatibility.UnityVersion,
+            ModVersion = _compatibility.ModVersion,
+            SaveHash = localSaveHash
         };
 
         _transport?.SendToServer(new ProtocolEnvelope(ProtocolMessageType.HandshakeRequest, NextSequence(), request.ToPayload()));
@@ -478,31 +495,35 @@ public sealed class MultiplayerController : IDisposable
             return;
         }
 
+        if (envelope.Type == ProtocolMessageType.SnapshotStateHash)
+        {
+            CheckSnapshotStateHash(senderId, envelope, () => SendSnapshot(peer, senderId));
+            return;
+        }
+
         if (envelope.Type != ProtocolMessageType.HandshakeRequest)
         {
             return;
         }
 
         var request = HandshakeRequest.FromPayload(envelope.Payload);
-        var response = HandshakeValidator.ValidateForHost(request, _sessionKey);
+        var response = ValidateHandshake(request);
         if (response.Accepted)
         {
             response.AssignedPlayerId = _nextPlayerId++;
             _liveSyncHost.RegisterPlayer(senderId, response.AssignedPlayerId);
+            _snapshotHashes.RegisterPeer(senderId);
         }
 
         var responseType = response.Accepted ? ProtocolMessageType.HandshakeAccepted : ProtocolMessageType.HandshakeRejected;
         _transport?.Send(peer, new ProtocolEnvelope(responseType, NextSequence(), response.ToPayload()));
-        if (!response.Accepted || _hostSnapshot == null)
+        if (!response.Accepted || !response.SnapshotRequired || _hostSnapshot == null)
         {
             return;
         }
 
-        _transport?.Send(peer, new ProtocolEnvelope(ProtocolMessageType.SnapshotManifest, NextSequence(), _hostSnapshot.Manifest.ToPayload()));
-        foreach (var chunk in _hostSnapshot.Chunks)
-        {
-            _transport?.Send(peer, new ProtocolEnvelope(ProtocolMessageType.SnapshotChunk, NextSequence(), chunk.ToPayload()));
-        }
+        _snapshotHashes.ExpectSnapshot(senderId, _hostSnapshot.Manifest.SnapshotId);
+        SendSnapshot(peer, senderId);
 
         _log($"Sent snapshot {_hostSnapshot.Manifest.SnapshotId} to {request.PlayerName} ({_hostSnapshot.Manifest.ChunkCount} chunks).");
     }
@@ -526,31 +547,35 @@ public sealed class MultiplayerController : IDisposable
             return;
         }
 
+        if (envelope.Type == ProtocolMessageType.SnapshotStateHash)
+        {
+            CheckSnapshotStateHash(connectionId, envelope, () => SendRelaySnapshot(connectionId));
+            return;
+        }
+
         if (envelope.Type != ProtocolMessageType.HandshakeRequest)
         {
             return;
         }
 
         var request = HandshakeRequest.FromPayload(envelope.Payload);
-        var response = HandshakeValidator.ValidateForHost(request, _sessionKey);
+        var response = ValidateHandshake(request);
         if (response.Accepted)
         {
             response.AssignedPlayerId = _nextPlayerId++;
             _liveSyncHost.RegisterPlayer(connectionId, response.AssignedPlayerId);
+            _snapshotHashes.RegisterPeer(connectionId);
         }
 
         var responseType = response.Accepted ? ProtocolMessageType.HandshakeAccepted : ProtocolMessageType.HandshakeRejected;
         _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(responseType, NextSequence(), response.ToPayload()));
-        if (!response.Accepted || _hostSnapshot == null)
+        if (!response.Accepted || !response.SnapshotRequired || _hostSnapshot == null)
         {
             return;
         }
 
-        _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(ProtocolMessageType.SnapshotManifest, NextSequence(), _hostSnapshot.Manifest.ToPayload()));
-        foreach (var chunk in _hostSnapshot.Chunks)
-        {
-            _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(ProtocolMessageType.SnapshotChunk, NextSequence(), chunk.ToPayload()));
-        }
+        _snapshotHashes.ExpectSnapshot(connectionId, _hostSnapshot.Manifest.SnapshotId);
+        SendRelaySnapshot(connectionId);
 
         _relayPlayerNames[connectionId] = request.PlayerName;
         _state.SetPlayers(new[] { "Host" }.Concat(_relayPlayerNames.Values));
@@ -575,7 +600,11 @@ public sealed class MultiplayerController : IDisposable
             {
                 var response = HandshakeResponse.FromPayload(envelope.Payload);
                 _localPlayerId = response.AssignedPlayerId;
-                _state.SetStatus(SessionStatus.Connected, $"Accepted as player {response.AssignedPlayerId}");
+                _expectedHostSaveHash = response.HostSaveHash;
+                var message = response.SnapshotRequired
+                    ? $"Accepted as player {response.AssignedPlayerId}; save differs, resyncing"
+                    : $"Accepted as player {response.AssignedPlayerId}; save hash verified";
+                _state.SetStatus(SessionStatus.Connected, message);
                 break;
             }
             case ProtocolMessageType.HandshakeRejected:
@@ -636,6 +665,19 @@ public sealed class MultiplayerController : IDisposable
         try
         {
             var saveBytes = SnapshotService.Reassemble(_clientManifest, _receivedChunks.Values);
+            var actualHash = Hashing.Sha256Hex(saveBytes);
+            SendSnapshotStateHash(new StateHashReport
+            {
+                SnapshotId = _clientManifest.SnapshotId,
+                SaveHash = actualHash
+            });
+
+            if (!StringComparer.OrdinalIgnoreCase.Equals(actualHash, _expectedHostSaveHash))
+            {
+                _state.SetError($"Snapshot save hash {actualHash} does not match the host hash {_expectedHostSaveHash}; awaiting one targeted retry.");
+                return;
+            }
+
             var userFolder = OutlandersSaveLocator.FindUserFolder();
             if (userFolder == null)
             {
@@ -653,6 +695,97 @@ public sealed class MultiplayerController : IDisposable
             _state.SetError($"Snapshot received, but Outlanders could not register it: {ex.Message}");
             _log($"Snapshot registration failed: {ex}");
         }
+    }
+
+    private HandshakeResponse ValidateHandshake(HandshakeRequest request)
+    {
+        return HandshakeValidator.ValidateForHost(
+            request,
+            _sessionKey,
+            _compatibility,
+            _hostSnapshot?.Manifest.Sha256 ?? string.Empty);
+    }
+
+    private void SendSnapshot(NetPeer peer, string senderId)
+    {
+        if (_hostSnapshot == null) return;
+        _transport?.Send(peer, new ProtocolEnvelope(ProtocolMessageType.SnapshotManifest, NextSequence(), _hostSnapshot.Manifest.ToPayload()));
+        foreach (var chunk in _hostSnapshot.Chunks)
+        {
+            _transport?.Send(peer, new ProtocolEnvelope(ProtocolMessageType.SnapshotChunk, NextSequence(), chunk.ToPayload()));
+        }
+
+        _log($"Sent snapshot {_hostSnapshot.Manifest.SnapshotId} to {senderId}.");
+    }
+
+    private void SendRelaySnapshot(string connectionId)
+    {
+        if (_hostSnapshot == null) return;
+        _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(ProtocolMessageType.SnapshotManifest, NextSequence(), _hostSnapshot.Manifest.ToPayload()));
+        foreach (var chunk in _hostSnapshot.Chunks)
+        {
+            _relayTransport?.SendToClient(connectionId, new ProtocolEnvelope(ProtocolMessageType.SnapshotChunk, NextSequence(), chunk.ToPayload()));
+        }
+
+        _log($"Sent snapshot {_hostSnapshot.Manifest.SnapshotId} to relay client {connectionId}.");
+    }
+
+    private void CheckSnapshotStateHash(string senderId, ProtocolEnvelope envelope, Action resendSnapshot)
+    {
+        StateHashReport report;
+        try
+        {
+            report = StateHashReport.FromPayload(envelope.Payload);
+            var expectedHash = _hostSnapshot?.Manifest.Sha256 ?? string.Empty;
+            var decision = _snapshotHashes.Evaluate(senderId, report, expectedHash, out var reason);
+            switch (decision)
+            {
+                case SnapshotHashDecision.Verified:
+                    _log($"Client {senderId} verified snapshot {report.SnapshotId} with save hash {report.SaveHash}.");
+                    return;
+                case SnapshotHashDecision.Resend:
+                    _log($"Client {senderId} reported a mismatched save hash; sending one targeted retry.");
+                    resendSnapshot();
+                    return;
+                case SnapshotHashDecision.RetryExhausted:
+                case SnapshotHashDecision.Rejected:
+                    _log($"Rejected snapshot hash from {senderId}: {reason}");
+                    return;
+            }
+        }
+        catch (Exception ex)
+        {
+            _log($"Rejected snapshot hash from {senderId}: {ex.Message}");
+        }
+    }
+
+    private void SendSnapshotStateHash(StateHashReport report)
+    {
+        var envelope = new ProtocolEnvelope(ProtocolMessageType.SnapshotStateHash, NextSequence(), report.ToPayload());
+        _transport?.SendToServer(envelope);
+        _relayTransport?.Send(envelope);
+    }
+
+    private string GetLocalSaveHash()
+    {
+        try
+        {
+            RefreshHostingSaveSelection();
+            var path = _selectedHostingSavePath;
+            return path == null ? string.Empty : OutlandersSaveLocator.HashSaveFile(path);
+        }
+        catch (Exception ex)
+        {
+            _log($"Could not hash the local save before joining: {ex.Message}");
+            return string.Empty;
+        }
+    }
+
+    private bool EnsureRuntimeCompatibility()
+    {
+        if (_compatibility.IsComplete) return true;
+        _state.SetError("Could not determine the running Outlanders build, Unity runtime, or mod version.");
+        return false;
     }
 
     private bool AcceptAndBroadcastIntent(string senderId, ProtocolEnvelope envelope, Action<string> reject)

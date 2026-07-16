@@ -8,6 +8,8 @@ public sealed class HandshakeResponse
     public bool Accepted { get; set; }
     public string Reason { get; set; } = string.Empty;
     public uint AssignedPlayerId { get; set; }
+    public string HostSaveHash { get; set; } = string.Empty;
+    public bool SnapshotRequired { get; set; }
 
     public byte[] ToPayload()
     {
@@ -16,6 +18,8 @@ public sealed class HandshakeResponse
         writer.Write(Accepted);
         writer.Write(AssignedPlayerId);
         ProtocolStrings.WriteBounded(writer, Reason, 512);
+        ProtocolStrings.WriteBounded(writer, HostSaveHash, 128);
+        writer.Write(SnapshotRequired);
         writer.Flush();
         return stream.ToArray();
     }
@@ -24,11 +28,19 @@ public sealed class HandshakeResponse
     {
         using var stream = new MemoryStream(payload, writable: false);
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
-        return new HandshakeResponse
+        var response = new HandshakeResponse
         {
             Accepted = reader.ReadBoolean(),
             AssignedPlayerId = reader.ReadUInt32(),
             Reason = ProtocolStrings.ReadBounded(reader, 512)
         };
+
+        if (stream.Position < stream.Length)
+        {
+            response.HostSaveHash = ProtocolStrings.ReadBounded(reader, 128);
+            response.SnapshotRequired = reader.ReadBoolean();
+        }
+
+        return response;
     }
 }

@@ -23,7 +23,11 @@ public static class TestRunner
         var tests = new List<(string Name, Action Body)>
         {
             ("protocol envelope round-trips", ProtocolEnvelopeRoundTrips),
-            ("handshake rejects wrong build", HandshakeRejectsWrongBuild),
+            ("handshake payload carries runtime compatibility", HandshakePayloadCarriesRuntimeCompatibility),
+            ("handshake rejects incompatible runtime metadata", HandshakeRejectsIncompatibleRuntimeMetadata),
+            ("handshake save hash controls resync", HandshakeSaveHashControlsResync),
+            ("snapshot hash gate requires handshake and exact snapshot", SnapshotHashGateRequiresHandshakeAndExactSnapshot),
+            ("snapshot hash retry is targeted and bounded", SnapshotHashRetryIsTargetedAndBounded),
             ("duplicate sequence filter rejects duplicates", DuplicateSequenceFilterRejectsDuplicates),
             ("direct live sync accepts and applies commands once", DirectLiveSyncAcceptsAndAppliesOnce),
             ("relay live sync routes accepted commands once", RelayLiveSyncRoutesAcceptedCommandsOnce),
@@ -76,15 +80,91 @@ public static class TestRunner
         Assert(Encoding.UTF8.GetString(unpacked.Payload) == "hello", "payload mismatch");
     }
 
-    private static void HandshakeRejectsWrongBuild()
+    private static void HandshakePayloadCarriesRuntimeCompatibility()
     {
-        var response = HandshakeValidator.ValidateForHost(new HandshakeRequest
-        {
-            OutlandersBuildGuid = "wrong",
-            UnityVersion = ProtocolConstants.ExpectedUnityVersion
-        }, expectedSessionKey: string.Empty);
+        var original = CompatibleRequest(Hashing.Sha256Hex(Encoding.UTF8.GetBytes("save")));
+        original.PlayerName = "Client";
+        original.SessionKey = "secret";
+        var restored = HandshakeRequest.FromPayload(original.ToPayload());
 
-        Assert(!response.Accepted, "wrong build should be rejected");
+        Assert(restored.PlayerName == original.PlayerName, "player name mismatch");
+        Assert(restored.SessionKey == original.SessionKey, "session key mismatch");
+        Assert(restored.ProtocolVersion == original.ProtocolVersion, "protocol version mismatch");
+        Assert(restored.OutlandersBuildGuid == original.OutlandersBuildGuid, "build GUID mismatch");
+        Assert(restored.UnityVersion == original.UnityVersion, "Unity version mismatch");
+        Assert(restored.ModVersion == original.ModVersion, "mod version mismatch");
+        Assert(restored.SaveHash == original.SaveHash, "save hash mismatch");
+    }
+
+    private static void HandshakeRejectsIncompatibleRuntimeMetadata()
+    {
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var wrongProtocol = CompatibleRequest(hostHash);
+        wrongProtocol.ProtocolVersion++;
+        AssertRejected(wrongProtocol, hostHash, "protocol version");
+
+        var wrongMod = CompatibleRequest(hostHash);
+        wrongMod.ModVersion = "9.9.9";
+        AssertRejected(wrongMod, hostHash, "mod version");
+
+        var wrongBuild = CompatibleRequest(hostHash);
+        wrongBuild.OutlandersBuildGuid = "different-build";
+        AssertRejected(wrongBuild, hostHash, "does not match host build");
+
+        var wrongUnity = CompatibleRequest(hostHash);
+        wrongUnity.UnityVersion = "different-unity";
+        AssertRejected(wrongUnity, hostHash, "does not match host runtime");
+    }
+
+    private static void HandshakeSaveHashControlsResync()
+    {
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var clientHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("client-save"));
+        var mismatch = Validate(CompatibleRequest(clientHash), hostHash);
+        Assert(mismatch.Accepted && mismatch.SnapshotRequired, "different save hash should require resync");
+        Assert(mismatch.HostSaveHash == hostHash, "host hash should be returned");
+
+        var matching = Validate(CompatibleRequest(hostHash), hostHash);
+        Assert(matching.Accepted && !matching.SnapshotRequired, "matching save hash should skip transfer");
+    }
+
+    private static void SnapshotHashGateRequiresHandshakeAndExactSnapshot()
+    {
+        var tracker = new SnapshotHashTracker();
+        var hash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var report = new StateHashReport { SnapshotId = "snapshot-1", SaveHash = hash };
+
+        Assert(tracker.Evaluate("peer-a", report, hash, out var reason) == SnapshotHashDecision.Rejected,
+            "pre-handshake snapshot report should be rejected");
+        Assert(reason.Contains("handshake", StringComparison.OrdinalIgnoreCase), "pre-handshake reason should be explicit");
+
+        tracker.RegisterPeer("peer-a");
+        tracker.ExpectSnapshot("peer-a", "snapshot-1");
+        var wrongSnapshot = new StateHashReport { SnapshotId = "snapshot-2", SaveHash = hash };
+        Assert(tracker.Evaluate("peer-a", wrongSnapshot, hash, out _) == SnapshotHashDecision.Rejected,
+            "wrong snapshot ID should be rejected");
+        Assert(tracker.Evaluate("peer-a", report, hash, out _) == SnapshotHashDecision.Verified,
+            "exact pending snapshot should verify");
+    }
+
+    private static void SnapshotHashRetryIsTargetedAndBounded()
+    {
+        var tracker = new SnapshotHashTracker();
+        var hostHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("host-save"));
+        var clientHash = Hashing.Sha256Hex(Encoding.UTF8.GetBytes("corrupt-save"));
+        var report = new StateHashReport { SnapshotId = "snapshot-1", SaveHash = clientHash };
+
+        tracker.RegisterPeer("peer-a");
+        tracker.RegisterPeer("peer-b");
+        tracker.ExpectSnapshot("peer-a", "snapshot-1");
+        Assert(tracker.Evaluate("peer-b", report, hostHash, out _) == SnapshotHashDecision.Rejected,
+            "a peer without the pending transfer must not trigger another peer's retry");
+        Assert(tracker.Evaluate("peer-a", report, hostHash, out _) == SnapshotHashDecision.Resend,
+            "first mismatch should allow one targeted retry");
+        Assert(tracker.Evaluate("peer-a", report, hostHash, out _) == SnapshotHashDecision.RetryExhausted,
+            "second mismatch must not amplify snapshot transfers");
+        Assert(tracker.Evaluate("peer-a", report, hostHash, out _) == SnapshotHashDecision.Rejected,
+            "exhausted transfer must remain closed");
     }
 
     private static void DuplicateSequenceFilterRejectsDuplicates()
@@ -553,6 +633,43 @@ public static class TestRunner
         Assert(decoded.RelayPort == 17668, "relay port mismatch");
         Assert(decoded.RoomCode == "ROOM123", "room code mismatch");
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
+    }
+
+    private static RuntimeCompatibility CompatibleRuntime()
+    {
+        return new RuntimeCompatibility
+        {
+            ProtocolVersion = ProtocolConstants.ProtocolVersion,
+            OutlandersBuildGuid = "runtime-build-guid",
+            UnityVersion = "2022.3.test",
+            ModVersion = "0.1.0"
+        };
+    }
+
+    private static HandshakeRequest CompatibleRequest(string saveHash)
+    {
+        var runtime = CompatibleRuntime();
+        return new HandshakeRequest
+        {
+            ProtocolVersion = runtime.ProtocolVersion,
+            OutlandersBuildGuid = runtime.OutlandersBuildGuid,
+            UnityVersion = runtime.UnityVersion,
+            ModVersion = runtime.ModVersion,
+            SaveHash = saveHash
+        };
+    }
+
+    private static HandshakeResponse Validate(HandshakeRequest request, string hostHash)
+    {
+        return HandshakeValidator.ValidateForHost(request, string.Empty, CompatibleRuntime(), hostHash);
+    }
+
+    private static void AssertRejected(HandshakeRequest request, string hostHash, string reasonFragment)
+    {
+        var response = Validate(request, hostHash);
+        Assert(!response.Accepted, $"{reasonFragment} mismatch should be rejected");
+        Assert(response.Reason.Contains(reasonFragment, StringComparison.OrdinalIgnoreCase),
+            $"rejection reason should mention {reasonFragment}: {response.Reason}");
     }
 
     private static ProtocolEnvelope IntentEnvelope(uint sequence, uint playerId, long tick, string commandType)
