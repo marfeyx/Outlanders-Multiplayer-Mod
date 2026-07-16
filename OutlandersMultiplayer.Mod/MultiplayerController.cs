@@ -21,7 +21,7 @@ public sealed class MultiplayerController : IDisposable
     private readonly SessionState _state;
     private readonly Action<string> _log;
     private readonly RuntimeCompatibility _compatibility;
-    private readonly Dictionary<string, SnapshotChunk> _receivedChunks = new();
+    private readonly SnapshotReceiver _snapshotReceiver = new();
     private readonly Dictionary<string, string> _relayPlayerNames = new(StringComparer.Ordinal);
     private readonly LiveSyncHost _liveSyncHost = new();
     private readonly LiveSyncClient _liveSyncClient = new();
@@ -29,7 +29,6 @@ public sealed class MultiplayerController : IDisposable
     private LiteNetLibDirectTransport? _transport;
     private TcpRelayTransport? _relayTransport;
     private SnapshotPackage? _hostSnapshot;
-    private SnapshotManifest? _clientManifest;
     private uint _nextSequence = 1;
     private uint _nextPlayerId = 2;
     private string _sessionKey = string.Empty;
@@ -140,8 +139,7 @@ public sealed class MultiplayerController : IDisposable
         if (!EnsureRuntimeCompatibility()) return;
         _isHost = false;
         _sessionKey = sessionKey ?? string.Empty;
-        _receivedChunks.Clear();
-        _clientManifest = null;
+        _snapshotReceiver.Reset();
 
         _transport = new LiteNetLibDirectTransport();
         _transport.PeerConnected += peer =>
@@ -199,8 +197,7 @@ public sealed class MultiplayerController : IDisposable
         if (!EnsureRuntimeCompatibility()) return;
         _isHost = false;
         _sessionKey = sessionKey ?? string.Empty;
-        _receivedChunks.Clear();
-        _clientManifest = null;
+        _snapshotReceiver.Reset();
 
         _relayTransport = CreateRelayTransport(relayHost);
         _relayTransport.Connected += () =>
@@ -261,9 +258,8 @@ public sealed class MultiplayerController : IDisposable
         _relayTransport?.Dispose();
         _relayTransport = null;
         _hostSnapshot = null;
-        _clientManifest = null;
         _expectedHostSaveHash = string.Empty;
-        _receivedChunks.Clear();
+        _snapshotReceiver.Reset();
         _relayPlayerNames.Clear();
         _liveSyncHost.Reset();
         _liveSyncClient.Reset();
@@ -633,16 +629,42 @@ public sealed class MultiplayerController : IDisposable
             }
             case ProtocolMessageType.SnapshotManifest:
             {
-                _clientManifest = SnapshotManifest.FromPayload(envelope.Payload);
-                _receivedChunks.Clear();
-                _state.SetStatus(SessionStatus.Connected, $"Receiving snapshot 0/{_clientManifest.ChunkCount}");
+                try
+                {
+                    var manifest = SnapshotManifest.FromPayload(envelope.Payload);
+                    _snapshotReceiver.Begin(manifest);
+                    _state.SetStatus(SessionStatus.Connected, $"Receiving snapshot 0/{manifest.ChunkCount}");
+                }
+                catch (Exception ex)
+                {
+                    RejectSnapshotTransfer(ex.Message);
+                }
+
                 break;
             }
             case ProtocolMessageType.SnapshotChunk:
             {
-                var chunk = SnapshotChunk.FromPayload(envelope.Payload);
-                _receivedChunks[$"{chunk.SnapshotId}:{chunk.Index}"] = chunk;
-                TryFinishSnapshot();
+                try
+                {
+                    var chunk = SnapshotChunk.FromPayload(envelope.Payload);
+                    var package = _snapshotReceiver.Add(chunk);
+                    if (package == null)
+                    {
+                        var manifest = _snapshotReceiver.Manifest!;
+                        _state.SetStatus(
+                            SessionStatus.Connected,
+                            $"Receiving snapshot {_snapshotReceiver.ReceivedChunkCount}/{manifest.ChunkCount}");
+                    }
+                    else
+                    {
+                        FinishSnapshot(package);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    RejectSnapshotTransfer(ex.Message);
+                }
+
                 break;
             }
             case ProtocolMessageType.AcceptedCommand:
@@ -668,33 +690,23 @@ public sealed class MultiplayerController : IDisposable
         }
     }
 
-    private void TryFinishSnapshot()
+    private void FinishSnapshot(SnapshotPackage package)
     {
-        if (_clientManifest == null || _receivedChunks.Count < _clientManifest.ChunkCount)
-        {
-            if (_clientManifest != null)
-            {
-                _state.SetStatus(SessionStatus.Connected, $"Receiving snapshot {_receivedChunks.Count}/{_clientManifest.ChunkCount}");
-            }
-
-            return;
-        }
-
         try
         {
-            var saveBytes = SnapshotService.Reassemble(_clientManifest, _receivedChunks.Values);
+            var saveBytes = SnapshotService.Reassemble(package.Manifest, package.Chunks);
             var actualHash = Hashing.Sha256Hex(saveBytes);
-            SendSnapshotStateHash(new StateHashReport
-            {
-                SnapshotId = _clientManifest.SnapshotId,
-                SaveHash = actualHash
-            });
-
             if (!StringComparer.OrdinalIgnoreCase.Equals(actualHash, _expectedHostSaveHash))
             {
-                _state.SetError($"Snapshot save hash {actualHash} does not match the host hash {_expectedHostSaveHash}; awaiting one targeted retry.");
-                return;
+                throw new InvalidDataException(
+                    $"Snapshot save hash {actualHash} does not match the hash announced during the handshake.");
             }
+
+            SendSnapshotStateHash(new StateHashReport
+            {
+                SnapshotId = package.Manifest.SnapshotId,
+                SaveHash = actualHash
+            });
 
             var userFolder = OutlandersSaveLocator.FindUserFolder();
             if (userFolder == null)
@@ -706,13 +718,21 @@ public sealed class MultiplayerController : IDisposable
             var fileName = Path.GetFileName(registered.Path);
             _state.SetStatus(SessionStatus.Connected, $"Host world registered as {fileName}");
             _state.SetRequiredAction($"Main Menu > Sandbox > Load > select {fileName}");
-            _log($"Received snapshot {_clientManifest.SnapshotId}; registered multiplayer save {registered.Path}");
+            _log($"Received snapshot {package.Manifest.SnapshotId}; registered multiplayer save {registered.Path}");
         }
         catch (Exception ex)
         {
-            _state.SetError($"Snapshot received, but Outlanders could not register it: {ex.Message}");
-            _log($"Snapshot registration failed: {ex}");
+            RejectSnapshotTransfer(ex.Message);
         }
+    }
+
+    private void RejectSnapshotTransfer(string reason)
+    {
+        var message = $"Snapshot transfer rejected: {reason}";
+        _snapshotReceiver.Reset();
+        Disconnect();
+        _state.SetError(message);
+        _log(message);
     }
 
     private HandshakeResponse ValidateHandshake(HandshakeRequest request)

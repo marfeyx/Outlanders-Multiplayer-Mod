@@ -176,6 +176,8 @@ Friend:
 
 Normal Outlanders saves are not overwritten by client snapshot joining.
 
+Snapshot transfers are rejected and disconnected before registration if their manifest, chunk layout, compressed data, or gzip output is inconsistent. Transfers are limited to 32 MiB compressed, 64 MiB uncompressed, 2,048 chunks, and 64 KiB per chunk. Duplicate, oversized, missing, or cross-snapshot chunks clear the in-progress transfer instead of being retained.
+
 The multiplayer overlay shows the exact `user-*\Endless_*.dat` save selected for hosting. Only top-level saves in `user-*` folders are eligible; backup subfolders and `OutlandersMultiplayerTemp` are never hosting candidates. If more than one normal save exists, use the previous/next controls to choose one before starting direct or relay hosting. Hosting refuses to start until that choice is valid.
 
 Client multiplayer snapshots are registered under the active save game's `Endless` folder with the first unused slot number:

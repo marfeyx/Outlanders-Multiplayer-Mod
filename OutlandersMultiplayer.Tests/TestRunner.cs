@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Security;
@@ -39,6 +40,10 @@ public static class TestRunner
             ("build placement reflection codec preserves game fields", BuildPlacementReflectionCodecRoundTrips),
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
+            ("snapshot manifest rejects negative and huge bounds", SnapshotManifestRejectsInvalidBounds),
+            ("snapshot manifest rejects inconsistent totals", SnapshotManifestRejectsInconsistentTotals),
+            ("snapshot receiver rejects oversized duplicate and mismatched chunks", SnapshotReceiverRejectsInvalidChunks),
+            ("snapshot decompression rejects gzip bombs", SnapshotDecompressionRejectsGzipBomb),
             ("multiplayer snapshots register without overwriting saves", MultiplayerSnapshotsRegisterWithoutOverwritingSaves),
             ("hosting save selection excludes unsafe paths", HostingSaveSelectionExcludesUnsafePaths),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
@@ -337,7 +342,17 @@ public static class TestRunner
     {
         var bytes = Enumerable.Range(0, 200_000).Select(i => (byte)(i % 251)).ToArray();
         var package = SnapshotService.Create("Endless_0.dat", bytes, chunkSize: 4096);
-        var restored = SnapshotService.Reassemble(package.Manifest, package.Chunks.Reverse());
+        var receiver = new SnapshotReceiver();
+        receiver.Begin(package.Manifest);
+        SnapshotPackage? received = null;
+        foreach (var chunk in package.Chunks.Reverse())
+        {
+            received = receiver.Add(chunk) ?? received;
+        }
+
+        Assert(received != null, "bounded receiver did not complete a valid snapshot");
+        Assert(receiver.Manifest == null && receiver.ReceivedChunkCount == 0, "completed receiver retained snapshot state");
+        var restored = SnapshotService.Reassemble(received!.Manifest, received.Chunks);
 
         Assert(restored.SequenceEqual(bytes), "restored snapshot does not match original");
         Assert(package.Manifest.Sha256 == Hashing.Sha256Hex(bytes), "hash mismatch");
@@ -360,6 +375,166 @@ public static class TestRunner
         }
 
         Assert(rejected, "corrupt snapshot should be rejected");
+    }
+
+    private static void SnapshotManifestRejectsInvalidBounds()
+    {
+        var invalidPayloads = new[]
+        {
+            CreateSnapshotManifestPayload(-1, 20, 20, 1),
+            CreateSnapshotManifestPayload(SnapshotLimits.MaxUncompressedBytes + 1, 20, 20, 1),
+            CreateSnapshotManifestPayload(1, -1, 20, 1),
+            CreateSnapshotManifestPayload(1, int.MaxValue, 20, 1),
+            CreateSnapshotManifestPayload(1, 20, -1, 1),
+            CreateSnapshotManifestPayload(1, 20, int.MaxValue, 1),
+            CreateSnapshotManifestPayload(1, 20, 20, -1),
+            CreateSnapshotManifestPayload(1, 20, 1, int.MaxValue)
+        };
+
+        foreach (var payload in invalidPayloads)
+        {
+            AssertInvalidData(
+                () => SnapshotManifest.FromPayload(payload),
+                "invalid signed snapshot bounds were accepted");
+        }
+    }
+
+    private static void SnapshotManifestRejectsInconsistentTotals()
+    {
+        AssertInvalidData(
+            () => SnapshotManifest.FromPayload(CreateSnapshotManifestPayload(100, 100, 32, 2)),
+            "manifest with inconsistent compressed size and chunk count was accepted");
+    }
+
+    private static void SnapshotReceiverRejectsInvalidChunks()
+    {
+        var package = SnapshotService.Create("Endless_0.dat", Encoding.UTF8.GetBytes("bounded-receiver"), chunkSize: 4);
+        var receiver = new SnapshotReceiver();
+
+        receiver.Begin(package.Manifest);
+        receiver.Add(package.Chunks[0]);
+        AssertInvalidData(
+            () => receiver.Add(package.Chunks[0]),
+            "duplicate snapshot chunk was accepted");
+        Assert(receiver.Manifest == null && receiver.ReceivedChunkCount == 0 && receiver.ReceivedCompressedBytes == 0,
+            "duplicate chunk rejection did not clear receiver state");
+
+        receiver.Begin(package.Manifest);
+        var mismatched = new SnapshotChunk
+        {
+            SnapshotId = "different-snapshot",
+            Index = package.Chunks[0].Index,
+            Data = package.Chunks[0].Data.ToArray()
+        };
+        AssertInvalidData(
+            () => receiver.Add(mismatched),
+            "chunk from another snapshot was accepted");
+        Assert(receiver.Manifest == null && receiver.ReceivedChunkCount == 0,
+            "mismatched chunk rejection did not clear receiver state");
+
+        var oversizedPayload = CreateSnapshotChunkPayload(SnapshotLimits.MaxChunkBytes + 1);
+        AssertInvalidData(
+            () => SnapshotChunk.FromPayload(oversizedPayload),
+            "oversized snapshot chunk payload was accepted");
+
+        receiver.Begin(package.Manifest);
+        var wrongLength = new SnapshotChunk
+        {
+            SnapshotId = package.Manifest.SnapshotId,
+            Index = package.Chunks[0].Index,
+            Data = new byte[package.Chunks[0].Data.Length + 1]
+        };
+        AssertInvalidData(
+            () => receiver.Add(wrongLength),
+            "chunk inconsistent with the manifest was accepted");
+        Assert(receiver.Manifest == null && receiver.ReceivedChunkCount == 0,
+            "inconsistent chunk rejection did not clear receiver state");
+    }
+
+    private static void SnapshotDecompressionRejectsGzipBomb()
+    {
+        var expanded = new byte[1024 * 1024];
+        byte[] compressed;
+        using (var output = new MemoryStream())
+        {
+            using (var gzip = new GZipStream(output, CompressionLevel.Fastest, leaveOpen: true))
+            {
+                gzip.Write(expanded, 0, expanded.Length);
+            }
+
+            compressed = output.ToArray();
+        }
+
+        const int declaredUncompressedBytes = 1024;
+        const int chunkSize = 4096;
+        var snapshotId = Guid.NewGuid().ToString("N");
+        var manifest = new SnapshotManifest
+        {
+            SnapshotId = snapshotId,
+            SaveName = "Endless_0.dat",
+            Sha256 = Hashing.Sha256Hex(new byte[declaredUncompressedBytes]),
+            UncompressedBytes = declaredUncompressedBytes,
+            CompressedBytes = compressed.Length,
+            ChunkSize = chunkSize,
+            ChunkCount = (compressed.Length + chunkSize - 1) / chunkSize
+        };
+        var chunks = new List<SnapshotChunk>();
+        for (var offset = 0; offset < compressed.Length; offset += chunkSize)
+        {
+            var length = Math.Min(chunkSize, compressed.Length - offset);
+            var data = new byte[length];
+            Buffer.BlockCopy(compressed, offset, data, 0, length);
+            chunks.Add(new SnapshotChunk { SnapshotId = snapshotId, Index = chunks.Count, Data = data });
+        }
+
+        AssertInvalidData(
+            () => SnapshotService.Reassemble(manifest, chunks),
+            "gzip payload expanding beyond the declared size was accepted");
+    }
+
+    private static byte[] CreateSnapshotManifestPayload(
+        int uncompressedBytes,
+        int compressedBytes,
+        int chunkSize,
+        int chunkCount)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        ProtocolStrings.WriteBounded(writer, "snapshot-id", SnapshotManifest.MaxSnapshotIdBytes);
+        ProtocolStrings.WriteBounded(writer, "Endless_0.dat", SnapshotManifest.MaxSaveNameBytes);
+        ProtocolStrings.WriteBounded(writer, new string('a', SnapshotManifest.Sha256HexLength), SnapshotManifest.Sha256HexLength);
+        writer.Write(uncompressedBytes);
+        writer.Write(compressedBytes);
+        writer.Write(chunkSize);
+        writer.Write(chunkCount);
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    private static byte[] CreateSnapshotChunkPayload(int dataLength)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+        ProtocolStrings.WriteBounded(writer, "snapshot-id", SnapshotManifest.MaxSnapshotIdBytes);
+        writer.Write(0);
+        writer.Write(dataLength);
+        writer.Write(new byte[dataLength]);
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    private static void AssertInvalidData(Action action, string message)
+    {
+        try
+        {
+            action();
+        }
+        catch (InvalidDataException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(message);
     }
 
     private static void HostingSaveSelectionExcludesUnsafePaths()
