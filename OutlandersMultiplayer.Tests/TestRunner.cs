@@ -21,7 +21,8 @@ public static class TestRunner
             ("snapshot chunks reassemble and validate", SnapshotChunksReassembleAndValidate),
             ("snapshot corruption is rejected", SnapshotCorruptionIsRejected),
             ("relay join and protocol frames round-trip", RelayFramesRoundTrip),
-            ("join code contains relay room and secret", JoinCodeRoundTrips)
+            ("join code contains relay room and secret", JoinCodeRoundTrips),
+            ("join code escapes delimiters and backslashes", JoinCodeSpecialCharactersRoundTrip)
         };
 
         var failed = 0;
@@ -137,6 +138,20 @@ public static class TestRunner
         Assert(decoded.RelayPort == 17668, "relay port mismatch");
         Assert(decoded.RoomCode == "ROOM123", "room code mismatch");
         Assert(decoded.SessionKey == "SECRET456", "session key mismatch");
+    }
+
+    private static void JoinCodeSpecialCharactersRoundTrip()
+    {
+        const string relayHost = @"relay|host\edge";
+        const string roomCode = @"ROOM\1|A";
+        const string sessionKey = @"SECRET|456\p";
+
+        var code = JoinCode.Encode(relayHost, 17668, roomCode, sessionKey);
+        Assert(JoinCode.TryDecode(code, out var decoded), "join code with special characters should decode");
+        Assert(decoded.RelayHost == relayHost, "escaped relay host mismatch");
+        Assert(decoded.RelayPort == 17668, "escaped join code relay port mismatch");
+        Assert(decoded.RoomCode == roomCode, "escaped room code mismatch");
+        Assert(decoded.SessionKey == sessionKey, "escaped session key mismatch");
     }
 
     private static void Assert(bool condition, string message)
